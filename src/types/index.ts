@@ -97,3 +97,5 @@ export interface RestResponse<T = unknown> {
   body: T;
 }
 
+export * from '../chat/types.js';
+
