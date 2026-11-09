@@ -69,6 +69,7 @@ export interface ApiGatewayOptions {
   discovery: import('./discovery.js').ServiceDiscoveryRegistry;
   configServer?: import('./config-server.js').ConfigurationServer;
   rateLimitOptions?: Partial<RateLimitOptions>;
+  enforceTls?: boolean;
 }
 
 export interface ClientContext {

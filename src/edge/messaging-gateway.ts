@@ -44,14 +44,14 @@ export class MessagingEdgeGateway {
       );
     }
 
-    // 2. Strict check: only chat destinations are permitted for external participants
-    const isChatQueue = destination.startsWith('queue.chat.');
-    const isChatTopic = destination.startsWith('topic.chat.');
-    if (!isChatQueue && !isChatTopic) {
+    // 2. Strict check: external chat is strictly restricted to point-to-point inbox queues
+    // Multi-party group chat rooms / chat topics are strictly out of scope per spec.
+    const isChatInboxQueue = destination.startsWith('queue.chat.inbox.');
+    if (!isChatInboxQueue) {
       throw new AclForbiddenDestinationError(
         destination,
         clientContext?.clientId,
-        `Destination '${destination}' interdite. Seules les destinations chat ('queue.chat.*', 'topic.chat.*') sont autorisées pour les participants externes.`
+        `Destination '${destination}' interdite. Seules les files de messagerie point-à-point ('queue.chat.inbox.<id_correspondant>') sont autorisées pour les participants externes (les salons de discussion / topics multi-parties sont hors périmètre).`
       );
     }
 

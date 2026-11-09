@@ -12,6 +12,7 @@ export class ApiGateway {
   public readonly discovery: ServiceDiscoveryRegistry;
   public readonly configServer?: ConfigurationServer;
   public readonly rateLimiter: RateLimiter;
+  public readonly enforceTls: boolean;
   private edgeCache = new Map<string, { body: any; status: number; expiresAt: number }>();
   private cacheTtlMs: number = 30_000;
 
@@ -19,6 +20,7 @@ export class ApiGateway {
     this.discovery = options.discovery;
     this.configServer = options.configServer;
     this.rateLimiter = new RateLimiter(options.rateLimitOptions);
+    this.enforceTls = options.enforceTls ?? false;
   }
 
   public setRateLimitOptions(options: Partial<RateLimitOptions>): void {
@@ -34,6 +36,26 @@ export class ApiGateway {
   }
 
   public async handleRequest(req: RestRequest): Promise<RestResponse> {
+    // 0. TLS Enforcement Check
+    if (this.enforceTls) {
+      const forwardedProto =
+        req.headers?.['x-forwarded-proto'] ?? req.headers?.['X-Forwarded-Proto'];
+      if (!forwardedProto || String(forwardedProto).toLowerCase() !== 'https') {
+        const err: ErreurApi = {
+          code: 'TLS_REQUIS',
+          message:
+            "Connexion sécurisée requise : l'en-tête X-Forwarded-Proto doit être 'https'.",
+          horodatage: new Date().toISOString(),
+          chemin: req.path,
+        };
+        return {
+          status: 403,
+          headers: { 'Content-Type': 'application/json' },
+          body: err,
+        };
+      }
+    }
+
     const cleanPath = req.path.split('?')[0].replace(/\/+$/, '');
 
     // 1. Rate Limiting Check on Sensitive Endpoints

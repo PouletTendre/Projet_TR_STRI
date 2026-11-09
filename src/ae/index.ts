@@ -573,7 +573,7 @@ export class AutoriteEnregistrement {
       if (cert.sujet !== entite.nomEntite) {
         const err: ErreurApi = {
           code: 'DROITS_INSUFFISANTS',
-          message: `L'entité '${body.nomEntite}' n'est pas le propriétaire (sujet) du certificat '${body.numeroSerieCertificat}'.`,
+          message: `L'entité '${body.nomEntite}' n'est pas le Porteur (Sujet) du certificat '${body.numeroSerieCertificat}'.`,
           horodatage: new Date().toISOString(),
           chemin: req.path,
         };

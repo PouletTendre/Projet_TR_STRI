@@ -172,6 +172,284 @@ export class CorrespondantClient {
     return correspondant;
   }
 
+  private validerCertificatCorrespondant(
+    correspondantId: string,
+    niveauSecurite: NiveauSecurite,
+    options?: {
+      certificatNumeroSerie?: string;
+      certificatChiffrementNumeroSerie?: string;
+    }
+  ): {
+    certSignature?: Certificat;
+    certChiffrement?: Certificat;
+  } {
+    if (niveauSecurite === 'NON_SECURISE') {
+      return {};
+    }
+
+    if (!this.annuaire || !this.av) {
+      throw new CertificateValidationError(
+        'Annuaire et Autorité de Validation (AV) sont requis pour valider les certificats sécurisés.'
+      );
+    }
+    const avInstance = this.getAvInstance();
+
+    let certSig: Certificat | undefined;
+    let certChiffre: Certificat | undefined;
+
+    if (niveauSecurite === 'SIGNE') {
+      certSig = this.resoudreCertificat(
+        correspondantId,
+        'SIGNATURE',
+        options?.certificatNumeroSerie
+      );
+      const valRes = avInstance.validerCertificat({
+        numeroSerieCertificat: certSig.numeroSerie,
+        usageAttendu: 'SIGNATURE',
+        sujetAttendu: correspondantId,
+      });
+      if (!valRes.valide) {
+        throw new CertificateValidationError(
+          `Validation AV préalable du certificat correspondant (${correspondantId}, signature) échouée : ${valRes.detailsEtapes.messageDiagnostic}`
+        );
+      }
+      return { certSignature: certSig };
+    }
+
+    if (niveauSecurite === 'CHIFFRE') {
+      certChiffre = this.resoudreCertificat(
+        correspondantId,
+        'CHIFFREMENT',
+        options?.certificatChiffrementNumeroSerie ?? options?.certificatNumeroSerie
+      );
+      const valRes = avInstance.validerCertificat({
+        numeroSerieCertificat: certChiffre.numeroSerie,
+        usageAttendu: 'CHIFFREMENT',
+        sujetAttendu: correspondantId,
+      });
+      if (!valRes.valide) {
+        throw new CertificateValidationError(
+          `Validation AV préalable du certificat correspondant (${correspondantId}, chiffrement) échouée : ${valRes.detailsEtapes.messageDiagnostic}`
+        );
+      }
+      return { certChiffrement: certChiffre };
+    }
+
+    if (niveauSecurite === 'SIGNE_ET_CHIFFRE') {
+      // Check if a specific cert was supplied that satisfies SIGNATURE_ET_CHIFFREMENT
+      if (options?.certificatNumeroSerie) {
+        const cert = this.annuaire.getCertificatParNumeroSerie(options.certificatNumeroSerie);
+        if (cert && cert.usage === 'SIGNATURE_ET_CHIFFREMENT') {
+          certSig = cert;
+          certChiffre = cert;
+        }
+      }
+
+      if (!certSig || !certChiffre) {
+        // Resolve signature certificate
+        certSig = this.resoudreCertificat(
+          correspondantId,
+          'SIGNATURE',
+          options?.certificatNumeroSerie
+        );
+        // Resolve encryption certificate
+        certChiffre = this.resoudreCertificat(
+          correspondantId,
+          'CHIFFREMENT',
+          options?.certificatChiffrementNumeroSerie ??
+            (options?.certificatNumeroSerie && options.certificatNumeroSerie !== certSig.numeroSerie
+              ? options.certificatNumeroSerie
+              : undefined)
+        );
+      }
+
+      if (certSig.numeroSerie === certChiffre.numeroSerie) {
+        const valRes = avInstance.validerCertificat({
+          numeroSerieCertificat: certSig.numeroSerie,
+          usageAttendu: 'SIGNATURE_ET_CHIFFREMENT',
+          sujetAttendu: correspondantId,
+        });
+        if (!valRes.valide) {
+          throw new CertificateValidationError(
+            `Validation AV préalable du certificat correspondant (${correspondantId}, combiné) échouée : ${valRes.detailsEtapes.messageDiagnostic}`
+          );
+        }
+      } else {
+        const valSig = avInstance.validerCertificat({
+          numeroSerieCertificat: certSig.numeroSerie,
+          usageAttendu: 'SIGNATURE',
+          sujetAttendu: correspondantId,
+        });
+        if (!valSig.valide) {
+          throw new CertificateValidationError(
+            `Validation AV préalable du certificat correspondant (${correspondantId}, signature) échouée : ${valSig.detailsEtapes.messageDiagnostic}`
+          );
+        }
+
+        const valChiffre = avInstance.validerCertificat({
+          numeroSerieCertificat: certChiffre.numeroSerie,
+          usageAttendu: 'CHIFFREMENT',
+          sujetAttendu: correspondantId,
+        });
+        if (!valChiffre.valide) {
+          throw new CertificateValidationError(
+            `Validation AV préalable du certificat correspondant (${correspondantId}, chiffrement) échouée : ${valChiffre.detailsEtapes.messageDiagnostic}`
+          );
+        }
+      }
+
+      return { certSignature: certSig, certChiffrement: certChiffre };
+    }
+
+    return {};
+  }
+
+  private preparerChargeUtileEtSignature(params: {
+    echangeId: string;
+    numeroSequence: number;
+    typeMessage: TypeMessageChat;
+    niveauSecurite: NiveauSecurite;
+    texte: string;
+    horodatage: string;
+    destinataireId: string;
+    clePriveeSignaturePem?: string;
+    clePubliqueDestinataire?: string;
+    certExpediteurSerial?: string | null;
+    certDestinataireSerial?: string | null;
+  }): {
+    payloadToSend: any;
+    signatureExpediteur: string | null;
+  } {
+    const {
+      echangeId,
+      numeroSequence,
+      typeMessage,
+      niveauSecurite,
+      texte,
+      horodatage,
+      destinataireId,
+      clePriveeSignaturePem,
+      clePubliqueDestinataire,
+      certExpediteurSerial,
+      certDestinataireSerial,
+    } = params;
+
+    if (niveauSecurite === 'NON_SECURISE') {
+      return {
+        payloadToSend: texte,
+        signatureExpediteur: null,
+      };
+    }
+
+    if (niveauSecurite === 'SIGNE') {
+      if (!clePriveeSignaturePem) {
+        throw new CertificateValidationError(
+          `Clé privée de signature requise pour expéditeur ${this.id}`
+        );
+      }
+      const signatureExpediteur = signChatMessage(
+        {
+          echangeId,
+          numeroSequence,
+          horodatage,
+          texte,
+        },
+        clePriveeSignaturePem
+      );
+      const payloadToSend = {
+        echangeId,
+        numeroSequence,
+        typeMessage,
+        niveauSecurite,
+        expediteur: this.id,
+        destinataire: destinataireId,
+        horodatage,
+        chargeUtile: {
+          contenuTexte: texte,
+          signatureExpediteur,
+          algorithmeSignature: 'SHA256withRSA',
+          numeroSerieCertExpediteur: certExpediteurSerial ?? null,
+          numeroSerieCertDestinataire: certDestinataireSerial ?? null,
+        },
+      };
+      return { payloadToSend, signatureExpediteur };
+    }
+
+    if (niveauSecurite === 'CHIFFRE') {
+      if (!clePubliqueDestinataire) {
+        throw new CertificateValidationError(
+          `Clé publique de chiffrement du destinataire ${destinataireId} requise`
+        );
+      }
+      const enc = encryptChatMessage(texte, clePubliqueDestinataire);
+      const payloadToSend = {
+        echangeId,
+        numeroSequence,
+        typeMessage,
+        niveauSecurite,
+        expediteur: this.id,
+        destinataire: destinataireId,
+        horodatage,
+        chargeUtile: {
+          contenuTexte: enc.contenuTexte,
+          cleSessionChiffreeCpDestinataire: enc.cleSessionChiffreeCpDestinataire,
+          iv: enc.iv,
+          tag: enc.tag,
+          algorithmeChiffrement: enc.algorithmeChiffrement,
+          numeroSerieCertExpediteur: certExpediteurSerial ?? null,
+          numeroSerieCertDestinataire: certDestinataireSerial ?? null,
+        },
+      };
+      return { payloadToSend, signatureExpediteur: null };
+    }
+
+    if (niveauSecurite === 'SIGNE_ET_CHIFFRE') {
+      if (!clePriveeSignaturePem) {
+        throw new CertificateValidationError(
+          `Clé privée de signature requise pour expéditeur ${this.id}`
+        );
+      }
+      if (!clePubliqueDestinataire) {
+        throw new CertificateValidationError(
+          `Clé publique de chiffrement du destinataire ${destinataireId} requise`
+        );
+      }
+      const signatureExpediteur = signChatMessage(
+        {
+          echangeId,
+          numeroSequence,
+          horodatage,
+          texte,
+        },
+        clePriveeSignaturePem
+      );
+      const enc = encryptChatMessage(texte, clePubliqueDestinataire);
+      const payloadToSend = {
+        echangeId,
+        numeroSequence,
+        typeMessage,
+        niveauSecurite,
+        expediteur: this.id,
+        destinataire: destinataireId,
+        horodatage,
+        chargeUtile: {
+          contenuTexte: enc.contenuTexte,
+          cleSessionChiffreeCpDestinataire: enc.cleSessionChiffreeCpDestinataire,
+          iv: enc.iv,
+          tag: enc.tag,
+          algorithmeChiffrement: enc.algorithmeChiffrement,
+          signatureExpediteur,
+          algorithmeSignature: 'SHA256withRSA',
+          numeroSerieCertExpediteur: certExpediteurSerial ?? null,
+          numeroSerieCertDestinataire: certDestinataireSerial ?? null,
+        },
+      };
+      return { payloadToSend, signatureExpediteur };
+    }
+
+    return { payloadToSend: texte, signatureExpediteur: null };
+  }
+
   public initialiserEchange(
     destinataireId: string,
     options?: InitialiserEchangeOptions
@@ -185,138 +463,23 @@ export class CorrespondantClient {
     const isFin = premierMessage === 'FIN_MSG';
     const typeMessage: TypeMessageChat = isFin ? 'FIN_MSG' : 'INIT_ECHANGE';
 
-    let senderCertSig: Certificat | undefined;
-    let senderCertChiffre: Certificat | undefined;
-    let recipientCertSig: Certificat | undefined;
-    let recipientCertChiffre: Certificat | undefined;
-
     // Pre-flight AV validation if secured exchange
-    if (niveauSecurite !== 'NON_SECURISE') {
-      if (!this.annuaire || !this.av) {
-        throw new CertificateValidationError(
-          'Annuaire et Autorité de Validation (AV) sont requis pour initialiser un échange sécurisé.'
-        );
-      }
-      const avInstance = this.getAvInstance();
+    const senderCerts = this.validerCertificatCorrespondant(this.id, niveauSecurite, {
+      certificatNumeroSerie: this.certificatNumeroSerie,
+      certificatChiffrementNumeroSerie:
+        this.certificatChiffrementNumeroSerie ?? this.certificatNumeroSerie,
+    });
 
-      // 1. Resolve and validate sender certificates
-      if (niveauSecurite === 'SIGNE' || niveauSecurite === 'SIGNE_ET_CHIFFRE') {
-        senderCertSig = this.resoudreCertificat(
-          this.id,
-          'SIGNATURE',
-          this.certificatNumeroSerie
-        );
-        const valResSig = avInstance.validerCertificat({
-          numeroSerieCertificat: senderCertSig.numeroSerie,
-          usageAttendu: 'SIGNATURE',
-          sujetAttendu: this.id,
-        });
-        if (!valResSig.valide) {
-          throw new CertificateValidationError(
-            `Validation AV préalable du certificat expéditeur (signature) échouée : ${valResSig.detailsEtapes.messageDiagnostic}`
-          );
-        }
-      }
-
-      if (
-        niveauSecurite === 'CHIFFRE' ||
-        niveauSecurite === 'SIGNE_ET_CHIFFRE'
-      ) {
-        senderCertChiffre = this.resoudreCertificat(
-          this.id,
-          'CHIFFREMENT',
-          this.certificatChiffrementNumeroSerie ?? this.certificatNumeroSerie
-        );
-        const valResChiffre = avInstance.validerCertificat({
-          numeroSerieCertificat: senderCertChiffre.numeroSerie,
-          usageAttendu: 'CHIFFREMENT',
-          sujetAttendu: this.id,
-        });
-        if (!valResChiffre.valide) {
-          throw new CertificateValidationError(
-            `Validation AV préalable du certificat expéditeur (chiffrement) échouée : ${valResChiffre.detailsEtapes.messageDiagnostic}`
-          );
-        }
-      }
-
-      // If combined in SIGNE_ET_CHIFFRE and same certificate, re-verify combined usage
-      if (
-        niveauSecurite === 'SIGNE_ET_CHIFFRE' &&
-        senderCertSig &&
-        senderCertChiffre &&
-        senderCertSig.numeroSerie === senderCertChiffre.numeroSerie
-      ) {
-        const valCombined = avInstance.validerCertificat({
-          numeroSerieCertificat: senderCertSig.numeroSerie,
-          usageAttendu: 'SIGNATURE_ET_CHIFFREMENT',
-          sujetAttendu: this.id,
-        });
-        if (!valCombined.valide) {
-          throw new CertificateValidationError(
-            `Validation AV préalable du certificat expéditeur (combiné) échouée : ${valCombined.detailsEtapes.messageDiagnostic}`
-          );
-        }
-      }
-
-      // 2. Resolve and validate recipient certificates
-      if (niveauSecurite === 'SIGNE' || niveauSecurite === 'SIGNE_ET_CHIFFRE') {
-        recipientCertSig = this.resoudreCertificat(
-          destinataireId,
-          'SIGNATURE',
-          options?.destinataireCertificatNumeroSerie
-        );
-        const valRecSig = avInstance.validerCertificat({
-          numeroSerieCertificat: recipientCertSig.numeroSerie,
-          usageAttendu: 'SIGNATURE',
-          sujetAttendu: destinataireId,
-        });
-        if (!valRecSig.valide) {
-          throw new CertificateValidationError(
-            `Validation AV préalable du certificat destinataire (signature) échouée : ${valRecSig.detailsEtapes.messageDiagnostic}`
-          );
-        }
-      }
-
-      if (
-        niveauSecurite === 'CHIFFRE' ||
-        niveauSecurite === 'SIGNE_ET_CHIFFRE'
-      ) {
-        recipientCertChiffre = this.resoudreCertificat(
-          destinataireId,
-          'CHIFFREMENT',
+    const recipientCerts = this.validerCertificatCorrespondant(
+      destinataireId,
+      niveauSecurite,
+      {
+        certificatNumeroSerie: options?.destinataireCertificatNumeroSerie,
+        certificatChiffrementNumeroSerie:
           options?.destinataireCertificatChiffrementNumeroSerie ??
-            options?.destinataireCertificatNumeroSerie
-        );
-        const valRecChiffre = avInstance.validerCertificat({
-          numeroSerieCertificat: recipientCertChiffre.numeroSerie,
-          usageAttendu: 'CHIFFREMENT',
-          sujetAttendu: destinataireId,
-        });
-        if (!valRecChiffre.valide) {
-          throw new CertificateValidationError(
-            `Validation AV préalable du certificat destinataire (chiffrement) échouée : ${valRecChiffre.detailsEtapes.messageDiagnostic}`
-          );
-        }
+          options?.destinataireCertificatNumeroSerie,
       }
-
-      if (
-        niveauSecurite === 'SIGNE_ET_CHIFFRE' &&
-        recipientCertSig &&
-        recipientCertChiffre &&
-        recipientCertSig.numeroSerie === recipientCertChiffre.numeroSerie
-      ) {
-        const valRecCombined = avInstance.validerCertificat({
-          numeroSerieCertificat: recipientCertSig.numeroSerie,
-          usageAttendu: 'SIGNATURE_ET_CHIFFREMENT',
-          sujetAttendu: destinataireId,
-        });
-        if (!valRecCombined.valide) {
-          throw new CertificateValidationError(
-            `Validation AV préalable du certificat destinataire (combiné) échouée : ${valRecCombined.detailsEtapes.messageDiagnostic}`
-          );
-        }
-      }
-    }
+    );
 
     const session: EchangeSession = {
       echangeId,
@@ -329,121 +492,37 @@ export class CorrespondantClient {
       dateCloture: isFin ? horodatage : undefined,
       messages: [],
       interlocuteurCertificatNumeroSerie:
-        recipientCertSig?.numeroSerie ?? recipientCertChiffre?.numeroSerie ?? null,
+        recipientCerts.certSignature?.numeroSerie ??
+        recipientCerts.certChiffrement?.numeroSerie ??
+        null,
       interlocuteurCertificatChiffrementNumeroSerie:
-        recipientCertChiffre?.numeroSerie ?? null,
+        recipientCerts.certChiffrement?.numeroSerie ?? null,
     };
 
-    let payloadToSend: any = premierMessage;
-    let signatureExpediteur: string | null = null;
     const certExpediteurSerial =
-      senderCertSig?.numeroSerie ??
-      senderCertChiffre?.numeroSerie ??
+      senderCerts.certSignature?.numeroSerie ??
+      senderCerts.certChiffrement?.numeroSerie ??
       this.certificatNumeroSerie ??
       null;
     const certDestinataireSerial =
-      recipientCertChiffre?.numeroSerie ??
-      recipientCertSig?.numeroSerie ??
+      recipientCerts.certChiffrement?.numeroSerie ??
+      recipientCerts.certSignature?.numeroSerie ??
       null;
 
-    if (niveauSecurite === 'NON_SECURISE') {
-      payloadToSend = premierMessage;
-    } else if (niveauSecurite === 'SIGNE') {
-      if (!this.clePriveePem) {
-        throw new CertificateValidationError(
-          `Clé privée de signature requise pour expéditeur ${this.id}`
-        );
-      }
-      signatureExpediteur = signChatMessage(
-        {
-          echangeId,
-          numeroSequence: 1,
-          horodatage,
-          texte: premierMessage,
-        },
-        this.clePriveePem
-      );
-      payloadToSend = {
+    const { payloadToSend, signatureExpediteur } =
+      this.preparerChargeUtileEtSignature({
         echangeId,
         numeroSequence: 1,
         typeMessage,
         niveauSecurite,
-        expediteur: this.id,
-        destinataire: destinataireId,
+        texte: premierMessage,
         horodatage,
-        chargeUtile: {
-          contenuTexte: premierMessage,
-          signatureExpediteur,
-          algorithmeSignature: 'SHA256withRSA',
-          numeroSerieCertExpediteur: certExpediteurSerial,
-          numeroSerieCertDestinataire: certDestinataireSerial,
-        },
-      };
-    } else if (niveauSecurite === 'CHIFFRE') {
-      const enc = encryptChatMessage(
-        premierMessage,
-        recipientCertChiffre!.clePublique
-      );
-      payloadToSend = {
-        echangeId,
-        numeroSequence: 1,
-        typeMessage,
-        niveauSecurite,
-        expediteur: this.id,
-        destinataire: destinataireId,
-        horodatage,
-        chargeUtile: {
-          contenuTexte: enc.contenuTexte,
-          cleSessionChiffreeCpDestinataire:
-            enc.cleSessionChiffreeCpDestinataire,
-          iv: enc.iv,
-          tag: enc.tag,
-          algorithmeChiffrement: enc.algorithmeChiffrement,
-          numeroSerieCertExpediteur: certExpediteurSerial,
-          numeroSerieCertDestinataire: certDestinataireSerial,
-        },
-      };
-    } else if (niveauSecurite === 'SIGNE_ET_CHIFFRE') {
-      if (!this.clePriveePem) {
-        throw new CertificateValidationError(
-          `Clé privée de signature requise pour expéditeur ${this.id}`
-        );
-      }
-      signatureExpediteur = signChatMessage(
-        {
-          echangeId,
-          numeroSequence: 1,
-          horodatage,
-          texte: premierMessage,
-        },
-        this.clePriveePem
-      );
-      const enc = encryptChatMessage(
-        premierMessage,
-        recipientCertChiffre!.clePublique
-      );
-      payloadToSend = {
-        echangeId,
-        numeroSequence: 1,
-        typeMessage,
-        niveauSecurite,
-        expediteur: this.id,
-        destinataire: destinataireId,
-        horodatage,
-        chargeUtile: {
-          contenuTexte: enc.contenuTexte,
-          cleSessionChiffreeCpDestinataire:
-            enc.cleSessionChiffreeCpDestinataire,
-          iv: enc.iv,
-          tag: enc.tag,
-          algorithmeChiffrement: enc.algorithmeChiffrement,
-          signatureExpediteur,
-          algorithmeSignature: 'SHA256withRSA',
-          numeroSerieCertExpediteur: senderCertSig!.numeroSerie,
-          numeroSerieCertDestinataire: recipientCertChiffre!.numeroSerie,
-        },
-      };
-    }
+        destinataireId,
+        clePriveeSignaturePem: this.clePriveePem,
+        clePubliqueDestinataire: recipientCerts.certChiffrement?.clePublique,
+        certExpediteurSerial,
+        certDestinataireSerial,
+      });
 
     const message: MessageChat = {
       echangeId,
@@ -527,53 +606,20 @@ export class CorrespondantClient {
       session.dateCloture = horodatage;
     }
 
-    let payloadToSend: any = texte;
-    let signatureExpediteur: string | null = null;
     let certExpediteurSerial = this.certificatNumeroSerie ?? null;
     let certDestinataireSerial =
       session.interlocuteurCertificatChiffrementNumeroSerie ??
       session.interlocuteurCertificatNumeroSerie ??
       null;
+    let destinataireClePublique: string | undefined = undefined;
 
-    if (session.niveauSecurite === 'NON_SECURISE') {
-      payloadToSend = texte;
-    } else if (session.niveauSecurite === 'SIGNE') {
+    if (session.niveauSecurite === 'SIGNE') {
       const senderCert = this.resoudreCertificat(
         this.id,
         'SIGNATURE',
         this.certificatNumeroSerie
       );
       certExpediteurSerial = senderCert.numeroSerie;
-      if (!this.clePriveePem) {
-        throw new CertificateValidationError(
-          `Clé privée de signature requise pour expéditeur ${this.id}`
-        );
-      }
-      signatureExpediteur = signChatMessage(
-        {
-          echangeId,
-          numeroSequence: nextSeq,
-          horodatage,
-          texte,
-        },
-        this.clePriveePem
-      );
-      payloadToSend = {
-        echangeId,
-        numeroSequence: nextSeq,
-        typeMessage,
-        niveauSecurite: session.niveauSecurite,
-        expediteur: this.id,
-        destinataire: session.interlocuteurId,
-        horodatage,
-        chargeUtile: {
-          contenuTexte: texte,
-          signatureExpediteur,
-          algorithmeSignature: 'SHA256withRSA',
-          numeroSerieCertExpediteur: certExpediteurSerial,
-          numeroSerieCertDestinataire: certDestinataireSerial,
-        },
-      };
     } else if (session.niveauSecurite === 'CHIFFRE') {
       const recipientCert = this.resoudreCertificat(
         session.interlocuteurId,
@@ -581,26 +627,7 @@ export class CorrespondantClient {
         session.interlocuteurCertificatChiffrementNumeroSerie ?? undefined
       );
       certDestinataireSerial = recipientCert.numeroSerie;
-      const enc = encryptChatMessage(texte, recipientCert.clePublique);
-      payloadToSend = {
-        echangeId,
-        numeroSequence: nextSeq,
-        typeMessage,
-        niveauSecurite: session.niveauSecurite,
-        expediteur: this.id,
-        destinataire: session.interlocuteurId,
-        horodatage,
-        chargeUtile: {
-          contenuTexte: enc.contenuTexte,
-          cleSessionChiffreeCpDestinataire:
-            enc.cleSessionChiffreeCpDestinataire,
-          iv: enc.iv,
-          tag: enc.tag,
-          algorithmeChiffrement: enc.algorithmeChiffrement,
-          numeroSerieCertExpediteur: certExpediteurSerial,
-          numeroSerieCertDestinataire: certDestinataireSerial,
-        },
-      };
+      destinataireClePublique = recipientCert.clePublique;
     } else if (session.niveauSecurite === 'SIGNE_ET_CHIFFRE') {
       const senderCert = this.resoudreCertificat(
         this.id,
@@ -608,49 +635,29 @@ export class CorrespondantClient {
         this.certificatNumeroSerie
       );
       certExpediteurSerial = senderCert.numeroSerie;
-      if (!this.clePriveePem) {
-        throw new CertificateValidationError(
-          `Clé privée de signature requise pour expéditeur ${this.id}`
-        );
-      }
-      signatureExpediteur = signChatMessage(
-        {
-          echangeId,
-          numeroSequence: nextSeq,
-          horodatage,
-          texte,
-        },
-        this.clePriveePem
-      );
       const recipientCert = this.resoudreCertificat(
         session.interlocuteurId,
         'CHIFFREMENT',
         session.interlocuteurCertificatChiffrementNumeroSerie ?? undefined
       );
       certDestinataireSerial = recipientCert.numeroSerie;
-      const enc = encryptChatMessage(texte, recipientCert.clePublique);
-      payloadToSend = {
+      destinataireClePublique = recipientCert.clePublique;
+    }
+
+    const { payloadToSend, signatureExpediteur } =
+      this.preparerChargeUtileEtSignature({
         echangeId,
         numeroSequence: nextSeq,
         typeMessage,
         niveauSecurite: session.niveauSecurite,
-        expediteur: this.id,
-        destinataire: session.interlocuteurId,
+        texte,
         horodatage,
-        chargeUtile: {
-          contenuTexte: enc.contenuTexte,
-          cleSessionChiffreeCpDestinataire:
-            enc.cleSessionChiffreeCpDestinataire,
-          iv: enc.iv,
-          tag: enc.tag,
-          algorithmeChiffrement: enc.algorithmeChiffrement,
-          signatureExpediteur,
-          algorithmeSignature: 'SHA256withRSA',
-          numeroSerieCertExpediteur: certExpediteurSerial,
-          numeroSerieCertDestinataire: certDestinataireSerial,
-        },
-      };
-    }
+        destinataireId: session.interlocuteurId,
+        clePriveeSignaturePem: this.clePriveePem,
+        clePubliqueDestinataire: destinataireClePublique,
+        certExpediteurSerial,
+        certDestinataireSerial,
+      });
 
     const message: MessageChat = {
       echangeId,
@@ -687,6 +694,7 @@ export class CorrespondantClient {
 
     return message;
   }
+
 
   public cloreEchange(echangeId: string): MessageChat {
     return this.envoyerMessage(echangeId, 'FIN_MSG', { typeMessage: 'FIN_MSG' });
@@ -785,24 +793,10 @@ export class CorrespondantClient {
 
     // 3. Pre-flight 4-step validation of sender cert upon INIT_ECHANGE reception
     if (typeMessage === 'INIT_ECHANGE' && !session && niveauSecurite !== 'NON_SECURISE') {
-      if (this.av && numeroSerieCertExpediteur) {
-        const avInstance = this.getAvInstance();
-        const usageAttendu: UsageCle =
-          niveauSecurite === 'SIGNE'
-            ? 'SIGNATURE'
-            : niveauSecurite === 'CHIFFRE'
-            ? 'CHIFFREMENT'
-            : 'SIGNATURE';
-        const valRes = avInstance.validerCertificat({
-          numeroSerieCertificat: numeroSerieCertExpediteur,
-          usageAttendu,
-          sujetAttendu: expediteurId,
+      if (this.av) {
+        this.validerCertificatCorrespondant(expediteurId, niveauSecurite, {
+          certificatNumeroSerie: numeroSerieCertExpediteur,
         });
-        if (!valRes.valide) {
-          throw new CertificateValidationError(
-            `Validation AV préalable du certificat expéditeur '${numeroSerieCertExpediteur}' échouée : ${valRes.detailsEtapes.messageDiagnostic}`
-          );
-        }
       }
     }
 

@@ -598,6 +598,63 @@ describe('Sécurisation cryptographique des Échanges de Messagerie (Ticket #7)'
       expect(alice.getEchange(sessionAlice.echangeId)?.etat).toBe('TERMINE');
       expect(bob.getEchange(sessionAlice.echangeId)?.etat).toBe('TERMINE');
     });
+
+    it('should reject INIT_ECHANGE with SIGNE_ET_CHIFFRE on receiver side when sender certificate only authorizes SIGNATURE', () => {
+      // Alice has ONLY a signature certificate
+      const aliceKeyPair = generateRsaKeyPair();
+      const certAliceSigOnly = creerCertificatPorteur({
+        sujet: 'alice@dsi.fr',
+        usage: 'SIGNATURE',
+        clePubliqueBase64: aliceKeyPair.publicKeyBase64,
+        numeroSerie: 'SN-ALICE-SIG-ONLY',
+      });
+
+      // Bob has combined certificate
+      const bobKeyPair = generateRsaKeyPair();
+      const certBob = creerCertificatPorteur({
+        sujet: 'bob@dsi.fr',
+        usage: 'SIGNATURE_ET_CHIFFREMENT',
+        clePubliqueBase64: bobKeyPair.publicKeyBase64,
+        numeroSerie: 'SN-BOB-COMBINED-02',
+      });
+
+      const bob = new CorrespondantClient({
+        id: 'bob@dsi.fr',
+        broker,
+        annuaire,
+        av: avMessagerie,
+        certificatNumeroSerie: certBob.numeroSerie,
+        clePriveePem: bobKeyPair.privateKeyPem,
+      });
+
+      // Directly send an INIT_ECHANGE message with SIGNE_ET_CHIFFRE to Bob inbox
+      // where the sender is alice@dsi.fr with SN-ALICE-SIG-ONLY
+      expect(() => {
+        broker.sendToQueue('queue.chat.inbox.bob@dsi.fr', {
+          headers: {
+            JMSCorrelationID: 'ech-invalid-sender-usage',
+            echange_id: 'ech-invalid-sender-usage',
+            type_message: 'INIT_ECHANGE',
+            niveau_securite: 'SIGNE_ET_CHIFFRE',
+            expediteur_id: 'alice@dsi.fr',
+            destinataire_id: 'bob@dsi.fr',
+            numero_serie_cert_expediteur: certAliceSigOnly.numeroSerie,
+            numero_sequence: 1,
+            horodatage: new Date().toISOString(),
+          },
+          payload: {
+            chargeUtile: {
+              contenuTexte: 'Tentative invalide',
+              numeroSerieCertExpediteur: certAliceSigOnly.numeroSerie,
+            },
+          },
+        });
+      }).toThrow(CertificateValidationError);
+
+      // Bob session should not be created
+      expect(bob.getEchange('ech-invalid-sender-usage')).toBeUndefined();
+    });
+
   });
 
   describe('Contrôle dynamique du statut de certificat en cours d\'échange', () => {

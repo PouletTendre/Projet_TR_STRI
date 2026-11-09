@@ -148,11 +148,16 @@ export class ServicePublication {
   }
 
   public rechercherCertificats(criteres?: {
+    numeroSerie?: string;
     sujet?: string;
     acEmettriceId?: string;
     usage?: UsageCle;
+    uniquementValides?: boolean;
   }): Certificat[] {
     let results = Array.from(this.certificatsParNumeroSerie.values());
+    if (criteres?.numeroSerie) {
+      results = results.filter((c) => c.numeroSerie === criteres.numeroSerie);
+    }
     if (criteres?.sujet) {
       results = results.filter((c) => c.sujet === criteres.sujet);
     }
@@ -163,6 +168,28 @@ export class ServicePublication {
     }
     if (criteres?.usage) {
       results = results.filter((c) => c.usage === criteres.usage);
+    }
+    if (criteres?.uniquementValides) {
+      const now = new Date();
+      results = results.filter((c) => {
+        const debut = new Date(c.dateDebutValidite);
+        const fin = new Date(c.dateFinValidite);
+        if (now < debut || now > fin) {
+          return false;
+        }
+        for (const lcr of this.lcrsParAcId.values()) {
+          const entree = lcr.entrees.find(
+            (e) => e.numeroSerieCertificat === c.numeroSerie
+          );
+          if (
+            entree &&
+            (entree.statut === "SUSPENDU" || entree.statut === "REVOQUE")
+          ) {
+            return false;
+          }
+        }
+        return true;
+      });
     }
     return results;
   }
@@ -285,10 +312,20 @@ export class ServicePublication {
 
     // 4. GET /annuaire/certificats
     if (req.method === 'GET' && cleanPath === '/annuaire/certificats') {
+      const uniquementValidesParam = req.query?.uniquementValides;
+      const uniquementValides =
+        uniquementValidesParam === 'true'
+          ? true
+          : uniquementValidesParam === 'false'
+          ? false
+          : undefined;
+
       const results = this.rechercherCertificats({
+        numeroSerie: req.query?.numeroSerie,
         sujet: req.query?.sujet,
         acEmettriceId: req.query?.acEmettriceId,
         usage: req.query?.usage as UsageCle | undefined,
+        uniquementValides,
       });
       return {
         status: 200,

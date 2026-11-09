@@ -334,7 +334,7 @@ export class AutoriteValidation {
     let messageDiagnostic = '';
     if (valide) {
       const acNames = chaine.slice(1).map((c) => c.sujet).join(' -> ');
-      messageDiagnostic = `Certificat valide : période active, chaîne de confiance vérifiée (${acNames}), statut VALIDE, usage ${leafCert.usage} conforme.`;
+      messageDiagnostic = `Certificat valide : période active, Chemin de certification vérifié (${acNames}), statut VALIDE, usage ${leafCert.usage} conforme.`;
     } else {
       const causes: string[] = [];
       if (!etape1PeriodeValiditeOk) {

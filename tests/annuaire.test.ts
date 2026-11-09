@@ -224,4 +224,126 @@ describe('Service de Publication (Annuaire) & REST Seam', () => {
     const err = res.body as ErreurApi;
     expect(err.code).toBe('RESSOURCE_INTROUVABLE');
   });
+
+  it('should support searching certificates by numeroSerie via rechercherCertificats and REST query', () => {
+    const hierarchie = bootstrapHierarchieAc(broker);
+    servicePub.enregistrerAutorites(hierarchie.allAcs.map((ac) => ac.getInfo()));
+
+    const targetAc = hierarchie.allAcs[1];
+    const targetSerial = targetAc.certificat.numeroSerie;
+
+    // Search via direct method
+    const directResults = servicePub.rechercherCertificats({ numeroSerie: targetSerial });
+    expect(directResults).toHaveLength(1);
+    expect(directResults[0].numeroSerie).toBe(targetSerial);
+
+    // Search via REST endpoint query param
+    const restResults = servicePub.handleRequest({
+      method: 'GET',
+      path: '/annuaire/certificats',
+      query: { numeroSerie: targetSerial },
+    });
+    expect(restResults.status).toBe(200);
+    const body = restResults.body as Certificat[];
+    expect(body).toHaveLength(1);
+    expect(body[0].numeroSerie).toBe(targetSerial);
+  });
+
+  it('should support filtering only valid certificates via uniquementValides query parameter', () => {
+    const hierarchie = bootstrapHierarchieAc(broker);
+    servicePub.enregistrerAutorites(hierarchie.allAcs.map((ac) => ac.getInfo()));
+
+    const acN3 = hierarchie.allAcs.find((ac) => ac.id === 'AC-N3-DSI-MESSAGERIE')!;
+
+    // 1. Valid certificate
+    const validCert = acN3.signerCertificat({
+      numeroSerie: 'SN-VALID-001',
+      sujet: 'user.valid@dsi.organisation.fr',
+      clePublique: 'dummyKeyValid',
+      usage: 'SIGNATURE',
+      natureRessource: 'messagerie',
+    });
+
+    // 2. Expired certificate
+    const expiredCert = acN3.signerCertificat({
+      numeroSerie: 'SN-EXPIRED-001',
+      sujet: 'user.expired@dsi.organisation.fr',
+      clePublique: 'dummyKeyExpired',
+      usage: 'SIGNATURE',
+      natureRessource: 'messagerie',
+      dateDebutValidite: '2020-01-01T00:00:00Z',
+      dateFinValidite: '2021-01-01T00:00:00Z',
+    });
+
+    // 3. Suspended certificate (registered in LCR)
+    const suspendedCert = acN3.signerCertificat({
+      numeroSerie: 'SN-SUSPENDED-001',
+      sujet: 'user.suspended@dsi.organisation.fr',
+      clePublique: 'dummyKeySuspended',
+      usage: 'SIGNATURE',
+      natureRessource: 'messagerie',
+    });
+
+    // 4. Revoked certificate (registered in LCR)
+    const revokedCert = acN3.signerCertificat({
+      numeroSerie: 'SN-REVOKED-001',
+      sujet: 'user.revoked@dsi.organisation.fr',
+      clePublique: 'dummyKeyRevoked',
+      usage: 'SIGNATURE',
+      natureRessource: 'messagerie',
+    });
+
+    // Publish LCR containing suspended and revoked certs
+    broker.publish('topic.pki.publications.lcr', {
+      headers: { identifiant_ac: acN3.id },
+      payload: {
+        identifiantAc: acN3.id,
+        numeroVersionLcr: 1,
+        entreesActives: [
+          {
+            numeroSerieCertificat: suspendedCert.numeroSerie,
+            statut: 'SUSPENDU',
+            dateInvalidation: new Date().toISOString(),
+            motif: 'Suspension temporaire',
+          },
+          {
+            numeroSerieCertificat: revokedCert.numeroSerie,
+            statut: 'REVOQUE',
+            dateInvalidation: new Date().toISOString(),
+            motif: 'Clé compromise',
+          },
+        ],
+      },
+    });
+
+    // When uniquementValides is false or absent: all 4 user certificates are returned
+    const resAll = servicePub.handleRequest({
+      method: 'GET',
+      path: '/annuaire/certificats',
+      query: { acEmettriceId: acN3.id },
+    });
+    expect((resAll.body as Certificat[])).toHaveLength(4);
+
+    // When uniquementValides is true: only SN-VALID-001 should be returned!
+    const resValides = servicePub.handleRequest({
+      method: 'GET',
+      path: '/annuaire/certificats',
+      query: {
+        acEmettriceId: acN3.id,
+        uniquementValides: 'true',
+      },
+    });
+    expect(resValides.status).toBe(200);
+    const valides = resValides.body as Certificat[];
+    expect(valides).toHaveLength(1);
+    expect(valides[0].numeroSerie).toBe('SN-VALID-001');
+
+    // Also test direct method with boolean true
+    const directValides = servicePub.rechercherCertificats({
+      acEmettriceId: acN3.id,
+      uniquementValides: true,
+    });
+    expect(directValides).toHaveLength(1);
+    expect(directValides[0].numeroSerie).toBe('SN-VALID-001');
+  });
 });

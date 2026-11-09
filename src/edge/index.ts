@@ -29,10 +29,24 @@ export interface EdgeEnvironment {
 /**
  * Convenience bootstrapper for the complete Edge layer and internal PKI
  */
+export interface EdgeEnvironmentOptions {
+  broker?: InMemoryJmsBroker;
+  enforceTls?: boolean;
+}
+
 export function bootstrapEdgeEnvironment(
-  customBroker?: InMemoryJmsBroker
+  customBrokerOrOptions?: InMemoryJmsBroker | EdgeEnvironmentOptions
 ): EdgeEnvironment {
-  const broker = customBroker ?? new InMemoryJmsBroker();
+  let broker: InMemoryJmsBroker;
+  let enforceTls = false;
+  if (customBrokerOrOptions instanceof InMemoryJmsBroker) {
+    broker = customBrokerOrOptions;
+  } else if (customBrokerOrOptions) {
+    broker = customBrokerOrOptions.broker ?? new InMemoryJmsBroker();
+    enforceTls = customBrokerOrOptions.enforceTls ?? false;
+  } else {
+    broker = new InMemoryJmsBroker();
+  }
   const annuaire = new ServicePublication(broker);
   const acHierarchy = bootstrapHierarchieAc(broker);
 
@@ -59,6 +73,7 @@ export function bootstrapEdgeEnvironment(
   const apiGateway = new ApiGateway({
     discovery,
     configServer,
+    enforceTls,
   });
 
   // Messaging Edge Gateway

@@ -578,5 +578,83 @@ describe('Ticket #8: Couche Micro-services « Edge »', () => {
       expect(session.etat).toBe('ACTIF');
       expect(bobReceivedText).toBe('Hello through Edge Gateway!');
     });
+
+    it('should strictly BLOCK external chat topics and non-inbox queues (multi-party group chat out of scope)', () => {
+      const env = bootstrapEdgeEnvironment(broker);
+      const bridge = env.messagingGateway.createClientBridge('alice@organisation.fr');
+
+      // Attempting to subscribe to chat topics
+      expect(() => {
+        bridge.subscribe('topic.chat.general', () => {});
+      }).toThrowError(AclForbiddenDestinationError);
+
+      expect(() => {
+        bridge.subscribe('topic.chat.salons.direction', () => {});
+      }).toThrowError(AclForbiddenDestinationError);
+
+      // Attempting to publish or send to chat topics
+      expect(() => {
+        bridge.publish('topic.chat.general', {
+          headers: {},
+          payload: { text: 'spam' },
+        });
+      }).toThrowError(AclForbiddenDestinationError);
+
+      // Attempting to send to a non-inbox chat queue
+      expect(() => {
+        bridge.sendToQueue('queue.chat.broadcast', {
+          headers: {},
+          payload: { text: 'spam' },
+        });
+      }).toThrowError(AclForbiddenDestinationError);
+    });
+
   });
+
+    describe('6. TLS Enforcement on API Gateway (enforceTls)', () => {
+      it('should enforce TLS when enforceTls is enabled and reject non-https requests with 403 TLS_REQUIS', async () => {
+        const env = bootstrapEdgeEnvironment({ broker, enforceTls: true });
+
+        // Request with missing X-Forwarded-Proto
+        const resMissing = await env.apiGateway.handleRequest({
+          method: 'GET',
+          path: '/annuaire/autorites',
+        });
+        expect(resMissing.status).toBe(403);
+        const errMissing = resMissing.body as ErreurApi;
+        expect(errMissing.code).toBe('TLS_REQUIS');
+
+        // Request with http X-Forwarded-Proto
+        const resHttp = await env.apiGateway.handleRequest({
+          method: 'GET',
+          path: '/annuaire/autorites',
+          headers: {
+            'X-Forwarded-Proto': 'http',
+          },
+        });
+        expect(resHttp.status).toBe(403);
+        const errHttp = resHttp.body as ErreurApi;
+        expect(errHttp.code).toBe('TLS_REQUIS');
+
+        // Request with https X-Forwarded-Proto
+        const resHttps = await env.apiGateway.handleRequest({
+          method: 'GET',
+          path: '/annuaire/autorites',
+          headers: {
+            'X-Forwarded-Proto': 'https',
+          },
+        });
+        expect(resHttps.status).toBe(200);
+      });
+
+      it('should allow requests without TLS when enforceTls is disabled by default', async () => {
+        const env = bootstrapEdgeEnvironment({ broker, enforceTls: false });
+        const res = await env.apiGateway.handleRequest({
+          method: 'GET',
+          path: '/annuaire/autorites',
+        });
+        expect(res.status).toBe(200);
+      });
+    });
+
 });
