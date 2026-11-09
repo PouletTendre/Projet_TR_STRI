@@ -1,3 +1,10 @@
+import type { InMemoryJmsBroker } from '../broker/index.js';
+import type { ServicePublication } from '../annuaire/index.js';
+import type {
+  AutoriteValidation,
+  ServiceAutoriteValidation,
+} from '../av/index.js';
+
 export type NiveauSecurite =
   | 'NON_SECURISE'
   | 'SIGNE'
@@ -19,6 +26,7 @@ export interface MessageChat {
   horodatage: string;
   numeroSerieCertExpediteur?: string | null;
   numeroSerieCertDestinataire?: string | null;
+  signature?: string | null;
 }
 
 export interface EchangeSession {
@@ -31,12 +39,16 @@ export interface EchangeSession {
   dateCreation: string;
   dateCloture?: string;
   messages: MessageChat[];
+  interlocuteurCertificatNumeroSerie?: string | null;
+  interlocuteurCertificatChiffrementNumeroSerie?: string | null;
 }
 
 export interface InitialiserEchangeOptions {
   niveauSecurite?: NiveauSecurite;
   premierMessage?: string;
   echangeId?: string;
+  destinataireCertificatNumeroSerie?: string;
+  destinataireCertificatChiffrementNumeroSerie?: string;
 }
 
 export interface EnvoyerMessageOptions {
@@ -46,3 +58,15 @@ export interface EnvoyerMessageOptions {
 }
 
 export type MessageChatListener = (message: MessageChat) => void;
+
+export interface CorrespondantClientConfig {
+  id: string;
+  broker: InMemoryJmsBroker;
+  certificatNumeroSerie?: string;
+  clePriveePem?: string;
+  clePubliquePem?: string;
+  certificatChiffrementNumeroSerie?: string;
+  clePriveeChiffrementPem?: string;
+  annuaire?: ServicePublication;
+  av?: AutoriteValidation | ServiceAutoriteValidation;
+}
