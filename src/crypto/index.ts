@@ -299,5 +299,3 @@ export function decryptChatMessage(
   );
   return decrypted.toString('utf-8');
 }
-
->>>>>>> implement-spec-1
