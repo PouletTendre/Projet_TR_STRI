@@ -1,0 +1,964 @@
+openapi: 3.0.3
+info:
+  title: API REST — Infrastructure à Clés Publiques (ICP) Distribuée (M2 STRI)
+  version: 1.0.0
+  description: |
+    Spécification standardisée OpenAPI 3.0 des services REST exposés par l'Infrastructure à Clés Publiques (ICP) au sein du domaine de confiance de l'organisation (via l'API Gateway).
+
+    Cette API couvre trois familles de services répartis :
+    1. **Autorités d'Enregistrement (AE)** (`/ae/{nature}/...`) : spécialisées par nature de ressource (`messagerie`, `routeurs`, `utilisateurs`, etc.), elles authentifient les Porteurs, vérifient leurs droits (`droit_signature`, `droit_chiffrement`, `droit_de_demande_de_revocation`) et relaient les demandes de création ou de révocation/suspension aux Autorités de Certification (AC) via JMS.
+    2. **Autorités de Validation (AV)** (`/av/{nature}/...`) : spécialisées par nature de ressource, elles renseignent les Utilisateurs ICP et Correspondants sur le statut courant d'un certificat (`VALIDE`, `SUSPENDU`, `REVOQUE`, `INCONNU`) et proposent un service de validation complète en 4 étapes (période de validité, signature et chemin de certification jusqu'à l'AC Racine, statut LCR, politique d'usage).
+    3. **Service de Publication / Annuaire PKI** (`/annuaire/...`) : référentiel public du domaine de confiance permettant de consulter les certificats émis, de reconstruire le chemin de certification sur les 3 niveaux d'AC et de récupérer les Listes de Certificats Révoqués (LCR).
+  contact:
+    name: M2 STRI — Projet Traitements Répartis (UPS / IRIT)
+
+servers:
+  - url: https://pki.organisation.internal/api/v1
+    description: API Gateway Edge (Point d'entrée unique du domaine de confiance)
+  - url: http://localhost:8080/api/v1
+    description: Environnement de développement local
+
+tags:
+  - name: Autorité d'Enregistrement (AE)
+    description: Enrôlement, demande de création de certificat et demande de révocation/suspension/réactivation par un Porteur.
+  - name: Autorité de Validation (AV)
+    description: Contrôle du statut courant d'un certificat et validation complète du chemin de certification et de la politique d'usage.
+  - name: Service de Publication (Annuaire & LCR)
+    description: Consultation publique des certificats émis, de la hiérarchie d'AC (Niveaux 1 à 3) et des Listes de Certificats Révoqués (LCR).
+
+paths:
+  /ae/{nature}/demandes-certification:
+    post:
+      tags:
+        - Autorité d'Enregistrement (AE)
+      summary: Soumettre une demande de création de certificat auprès d'une AE
+      description: |
+        Processus de création de certificat :
+        1. Le Porteur soumet son identité (`nomEntite`), son secret d'authentification (`motDePasse`), l'usage escompté (`usage`), l'AC de rattachement organisationnel (`acCibleId`) et sa Clé Publique (`clePublique`) — ou demande à l'AC de générer la biclé (`genererBicle: true`).
+        2. L'AE authentifie le demandeur et vérifie ses droits (`droit_signature`, `droit_chiffrement`).
+        3. L'AE transmet la demande à l'AC compétente via la file JMS `queue.pki.ac.<id_ac>.demandes`.
+        4. L'AC génère et signe le certificat, demande sa publication sur `topic.pki.publications.certificats`, et le retourne à l'AE sur `queue.pki.ae.<id_ae>.reponses`.
+        5. L'AE relaie le certificat signé au demandeur.
+      operationId: creerDemandeCertification
+      parameters:
+        - $ref: '#/components/parameters/NatureRessourceParam'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DemandeCertificationRequete'
+            examples:
+              demandeAvecClePublique:
+                summary: Demande nominale avec clé publique fournie par le Porteur
+                value:
+                  nomEntite: "alice.martin@dsi.organisation.fr"
+                  motDePasse: "SecretP@ss2026!"
+                  acCibleId: "AC-N3-DSI-MESSAGERIE"
+                  usage: "SIGNATURE_ET_CHIFFREMENT"
+                  clePublique: "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA..."
+                  genererBicle: false
+              demandeAvecGenerationBicle:
+                summary: Demande avec génération de biclé déléguée à l'AC
+                value:
+                  nomEntite: "routeur-core-01.infra.organisation.fr"
+                  motDePasse: "RouterAuth#99"
+                  acCibleId: "AC-N3-INFRA-RESEAU"
+                  usage: "SIGNATURE"
+                  genererBicle: true
+      responses:
+        '201':
+          description: Certificat généré, signé par l'AC, publié et retourné au Porteur.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DemandeCertificationReponse'
+        '202':
+          description: Demande authentifiée et transmise à l'AC en attente de traitement asynchrone.
+          headers:
+            Location:
+              description: URI de suivi de la demande de certification.
+              schema:
+                type: string
+                format: uri
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DemandeCertificationReponse'
+        '400':
+          $ref: '#/components/responses/ErreurRequeteInvalide'
+        '401':
+          $ref: '#/components/responses/ErreurNonAuthentifie'
+        '403':
+          $ref: '#/components/responses/ErreurDroitsInsuffisants'
+        '404':
+          $ref: '#/components/responses/ErreurRessourceIntrouvable'
+
+  /ae/{nature}/demandes-certification/{demandeId}:
+    get:
+      tags:
+        - Autorité d'Enregistrement (AE)
+      summary: Consulter l'état d'une demande de certification et récupérer le certificat émis
+      operationId: getDemandeCertification
+      parameters:
+        - $ref: '#/components/parameters/NatureRessourceParam'
+        - name: demandeId
+          in: path
+          required: true
+          description: Identifiant unique de la demande de certification (`JMSCorrelationID`).
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: État courant de la demande de certification et certificat signé si disponible.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DemandeCertificationReponse'
+        '404':
+          $ref: '#/components/responses/ErreurRessourceIntrouvable'
+
+  /ae/{nature}/demandes-revocation:
+    post:
+      tags:
+        - Autorité d'Enregistrement (AE)
+      summary: Demander la révocation, la suspension ou la réactivation d'un certificat
+      description: |
+        Processus de révocation de certificat :
+        1. Le Porteur demande à rendre son certificat invalide définitivement (`REVOCATION`) ou temporairement (`SUSPENSION`) avant sa date de fin de validité, ou à lever une suspension (`REACTIVATION`).
+        2. L'AE procède à l'authentification (`nomEntite`, `motDePasse`) et vérifie que l'entité possède `droit_de_demande_de_revocation = true` et est bien propriétaire du certificat.
+        3. L'AE transmet la demande à l'AC émettrice via la file JMS `queue.pki.ac.<id_ac>.demandes`.
+        4. L'AC enregistre le changement d'état et publie la mise à jour de la LCR sur `topic.pki.publications.lcr`.
+      operationId: creerDemandeRevocation
+      parameters:
+        - $ref: '#/components/parameters/NatureRessourceParam'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DemandeRevocationRequete'
+            examples:
+              revocationDefinitive:
+                summary: Révocation définitive pour compromission de clé privée
+                value:
+                  nomEntite: "alice.martin@dsi.organisation.fr"
+                  motDePasse: "SecretP@ss2026!"
+                  numeroSerieCertificat: "SN-2026-DSI-000142"
+                  action: "REVOCATION"
+                  motif: "COMPROMISSION_CLE_PRIVEE"
+              suspensionTemporaire:
+                summary: Suspension temporaire pendant un congé ou une maintenance
+                value:
+                  nomEntite: "alice.martin@dsi.organisation.fr"
+                  motDePasse: "SecretP@ss2026!"
+                  numeroSerieCertificat: "SN-2026-DSI-000142"
+                  action: "SUSPENSION"
+                  motif: "SUSPENSION_TEMPORAIRE"
+      responses:
+        '200':
+          description: Révocation, suspension ou réactivation enregistrée par l'AC et publiée dans la LCR.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DemandeRevocationReponse'
+        '400':
+          $ref: '#/components/responses/ErreurRequeteInvalide'
+        '401':
+          $ref: '#/components/responses/ErreurNonAuthentifie'
+        '403':
+          $ref: '#/components/responses/ErreurDroitsInsuffisants'
+        '404':
+          $ref: '#/components/responses/ErreurRessourceIntrouvable'
+        '409':
+          description: Transition d'état invalide (ex. tentative de réactiver un certificat révoqué définitivement ou déjà expiré).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErreurApi'
+
+  /ae/{nature}/entites/{nomEntite}/droits:
+    get:
+      tags:
+        - Autorité d'Enregistrement (AE)
+      summary: Consulter les droits enregistrés d'une entité auprès de l'AE
+      description: Permet à une ressource authentifiée de vérifier ses droits enregistrés dans la base de l'AE (`droitSignature`, `droitChiffrement`, `droitDemandeRevocation`).
+      operationId: getDroitsEntite
+      parameters:
+        - $ref: '#/components/parameters/NatureRessourceParam'
+        - name: nomEntite
+          in: path
+          required: true
+          description: Identifiant (sujet) de l'entité enregistrée dans l'AE.
+          schema:
+            type: string
+        - name: X-Entite-Mot-De-Passe
+          in: header
+          required: true
+          description: Mot de passe de l'entité pour authentification auprès de l'AE.
+          schema:
+            type: string
+            format: password
+      responses:
+        '200':
+          description: Droits associés à l'entité dans l'AE.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DroitsEntiteAE'
+        '401':
+          $ref: '#/components/responses/ErreurNonAuthentifie'
+        '404':
+          $ref: '#/components/responses/ErreurRessourceIntrouvable'
+
+  /av/{nature}/certificats/{numeroSerie}/statut:
+    get:
+      tags:
+        - Autorité de Validation (AV)
+      summary: Obtenir le statut courant d'un certificat (Étape 3 du processus de validation)
+      description: |
+        Retourne l'état courant du certificat identifié par son numéro de série unique :
+        - `VALIDE` : certificat connu, en cours de validité temporelle et absent de la LCR.
+        - `SUSPENDU` : certificat temporairement invalidé dans la LCR (doit être refusé pour tout usage).
+        - `REVOQUE` : certificat définitivement révoqué dans la LCR (doit être refusé pour tout usage).
+        - `INCONNU` : numéro de série inconnu dans le domaine de confiance.
+      operationId: getStatutCertificat
+      parameters:
+        - $ref: '#/components/parameters/NatureRessourceParam'
+        - $ref: '#/components/parameters/NumeroSerieParam'
+      responses:
+        '200':
+          description: Statut courant du certificat auprès de l'AV.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatutCertificatReponse'
+
+  /av/{nature}/validations:
+    post:
+      tags:
+        - Autorité de Validation (AV)
+      summary: Exécuter le processus complet de validation d'un certificat en 4 étapes
+      description: |
+        Réalise les 4 contrôles réglementaires du processus de validation des certificats :
+        1. **Contrôle de la période de validité** (`dateDebutValidite <= horodatage <= dateFinValidite`).
+        2. **Vérification de la signature du certificat et analyse du chemin de certification** en remontant les AC filles signataires (Niveau 3 $\rightarrow$ Niveau 2 $\rightarrow$ AC Racine Niveau 1 auto-signée).
+        3. **Contrôle de l'état du certificat et des AC intermédiaires** vis-à-vis des LCR (`VALIDE` vs `SUSPENDU` / `REVOQUE` / `INCONNU`).
+        4. **Contrôle de la politique d'usage du certificat** vis-à-vis de l'opération souhaitée (`SIGNATURE`, `CHIFFREMENT`, `SIGNATURE_ET_CHIFFREMENT`).
+      operationId: validerCertificatComplet
+      parameters:
+        - $ref: '#/components/parameters/NatureRessourceParam'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ValidationCertificatRequete'
+            examples:
+              validationPourChatSigneEtChiffre:
+                summary: Validation du certificat d'un correspondant avant ouverture d'un échange signé et chiffré
+                value:
+                  numeroSerieCertificat: "SN-2026-DSI-000142"
+                  usageAttendu: "SIGNATURE_ET_CHIFFREMENT"
+                  sujetAttendu: "alice.martin@dsi.organisation.fr"
+      responses:
+        '200':
+          description: Résultat détaillé des 4 étapes de validation et chemin de certification vérifié.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ValidationCertificatReponse'
+        '400':
+          $ref: '#/components/responses/ErreurRequeteInvalide'
+
+  /annuaire/certificats:
+    get:
+      tags:
+        - Service de Publication (Annuaire & LCR)
+      summary: Rechercher des certificats publiés dans le domaine de confiance
+      description: Permet à un Utilisateur ICP ou à un Correspondant de rechercher le certificat public d'une entité par sujet, par AC émettrice ou par usage autorisé.
+      operationId: rechercherCertificats
+      parameters:
+        - name: sujet
+          in: query
+          required: false
+          description: Identité du propriétaire (sujet) du certificat (ex. `bob.dupont@rh.organisation.fr`).
+          schema:
+            type: string
+        - name: acEmettriceId
+          in: query
+          required: false
+          description: Identifiant de l'Autorité de Certification ayant émis le certificat.
+          schema:
+            type: string
+        - name: usage
+          in: query
+          required: false
+          description: Filtre sur l'usage autorisé de la clé.
+          schema:
+            $ref: '#/components/schemas/UsageCle'
+        - name: uniquementValides
+          in: query
+          required: false
+          description: Si vrai, exclut les certificats révoqués, suspendus ou expirés.
+          schema:
+            type: boolean
+            default: true
+      responses:
+        '200':
+          description: Liste des certificats correspondant aux critères.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Certificat'
+
+  /annuaire/certificats/{numeroSerie}:
+    get:
+      tags:
+        - Service de Publication (Annuaire & LCR)
+      summary: Récupérer un certificat par son numéro de série unique
+      operationId: getCertificatParNumeroSerie
+      parameters:
+        - $ref: '#/components/parameters/NumeroSerieParam'
+      responses:
+        '200':
+          description: Certificat complet.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Certificat'
+        '404':
+          $ref: '#/components/responses/ErreurRessourceIntrouvable'
+
+  /annuaire/certificats/{numeroSerie}/chemin-certification:
+    get:
+      tags:
+        - Service de Publication (Annuaire & LCR)
+      summary: Obtenir le chemin de certification complet jusqu'à l'AC Racine
+      description: |
+        Retourne la liste ordonnée des certificats permettant de remonter du certificat « utilisateur » (indice 0) jusqu'au certificat auto-signé de l'AC Racine de niveau 1 (dernier élément), en passant par les AC filles intermédiaires (niveau 3 puis niveau 2).
+      operationId: getCheminCertification
+      parameters:
+        - $ref: '#/components/parameters/NumeroSerieParam'
+      responses:
+        '200':
+          description: Chemin de certification ordonné du certificat cible jusqu'à l'AC Racine.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CheminCertificationReponse'
+        '404':
+          $ref: '#/components/responses/ErreurRessourceIntrouvable'
+
+  /annuaire/autorites:
+    get:
+      tags:
+        - Service de Publication (Annuaire & LCR)
+      summary: Lister la hiérarchie des Autorités de Certification (Niveaux 1, 2, 3)
+      operationId: listerAutoritesCertification
+      parameters:
+        - name: niveau
+          in: query
+          required: false
+          description: Filtrer par niveau hiérarchique (1 = AC Racine, 2 = AC Direction, 3 = AC Service).
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 5
+      responses:
+        '200':
+          description: Liste des Autorités de Certification déployées et leurs certificats associés.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/AutoriteCertificationInfo'
+
+  /annuaire/autorites/{acId}/lcr:
+    get:
+      tags:
+        - Service de Publication (Annuaire & LCR)
+      summary: Récupérer la Liste des Certificats Révoqués (LCR) publiée par une AC spécifique
+      operationId: getLcrParAutorite
+      parameters:
+        - name: acId
+          in: path
+          required: true
+          description: Identifiant unique de l'Autorité de Certification (ex. `AC-N3-DSI-MESSAGERIE`).
+          schema:
+            type: string
+      responses:
+        '200':
+          description: LCR signée par l'Autorité de Certification.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ListeCertificatsRevoques'
+        '404':
+          $ref: '#/components/responses/ErreurRessourceIntrouvable'
+
+  /annuaire/lcr:
+    get:
+      tags:
+        - Service de Publication (Annuaire & LCR)
+      summary: Récupérer la LCR consolidée de l'ensemble du domaine de confiance
+      operationId: getLcrConsolidee
+      responses:
+        '200':
+          description: Liste consolidée des entrées de révocation et de suspension de toutes les AC du domaine.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/ListeCertificatsRevoques'
+
+components:
+  parameters:
+    NatureRessourceParam:
+      name: nature
+      in: path
+      required: true
+      description: |
+        Nature fonctionnelle de la ressource adressant l'AE ou l'AV :
+        - `messagerie` : clients et correspondants de l'application de messagerie texte
+        - `routeurs` : équipements matériels réseau
+        - `services` : composants logiciels internes
+        - `utilisateurs` : ressources humaines générales
+      schema:
+        type: string
+        enum:
+          - messagerie
+          - routeurs
+          - services
+          - utilisateurs
+    NumeroSerieParam:
+      name: numeroSerie
+      in: path
+      required: true
+      description: Numéro de série unique du certificat dans le domaine de confiance (ex. `SN-2026-DSI-000142`).
+      schema:
+        type: string
+
+  schemas:
+    UsageCle:
+      type: string
+      description: |
+        Portée d'usage autorisée pour la biclé associée au certificat :
+        - `SIGNATURE` : signature numérique et authentification uniquement
+        - `CHIFFREMENT` : chiffrement de messages uniquement
+        - `SIGNATURE_ET_CHIFFREMENT` : signature numérique et chiffrement de messages
+        - `CERTIFICATION_AC` : réservé aux certificats d'Autorités de Certification (Niveaux 1, 2, 3) pour signer d'autres certificats et les LCR
+      enum:
+        - SIGNATURE
+        - CHIFFREMENT
+        - SIGNATURE_ET_CHIFFREMENT
+        - CERTIFICATION_AC
+
+    StatutCertificat:
+      type: string
+      description: Statut courant d'un certificat tel que déterminé par l'Autorité de Validation (AV).
+      enum:
+        - VALIDE
+        - SUSPENDU
+        - REVOQUE
+        - INCONNU
+
+    Certificat:
+      type: object
+      required:
+        - numeroSerie
+        - identifiantAcEmettrice
+        - dateDebutValidite
+        - dateFinValidite
+        - usage
+        - sujet
+        - clePublique
+        - signatureAc
+      description: |
+        Certificat manipulé dans le domaine de confiance conformément aux spécifications du noyau de l'application.
+      properties:
+        numeroSerie:
+          type: string
+          description: Numéro de série unique du certificat dans le domaine de confiance.
+          example: "SN-2026-DSI-000142"
+        identifiantAcEmettrice:
+          type: string
+          description: Identifiant de l'AC qui a édité et signé ce certificat.
+          example: "AC-N3-DSI-MESSAGERIE"
+        niveauAcEmettrice:
+          type: integer
+          description: Niveau hiérarchique de l'AC émettrice (1 = Racine, 2 = Direction, 3 = Service).
+          example: 3
+        dateDebutValidite:
+          type: string
+          format: date-time
+          description: Date et heure de début de la période de validité du certificat.
+          example: "2026-01-01T00:00:00Z"
+        dateFinValidite:
+          type: string
+          format: date-time
+          description: Date et heure de fin de la période de validité du certificat.
+          example: "2027-01-01T00:00:00Z"
+        usage:
+          $ref: '#/components/schemas/UsageCle'
+        sujet:
+          type: string
+          description: Identité du propriétaire (ou sujet) du certificat.
+          example: "alice.martin@dsi.organisation.fr"
+        natureRessource:
+          type: string
+          description: Nature de la ressource propriétaire (`messagerie`, `routeurs`, `services`, `utilisateurs`, `autorite_certification`).
+          example: "messagerie"
+        clePublique:
+          type: string
+          description: Clé Publique (CP) encodée en Base64 (format X.509 SubjectPublicKeyInfo / PEM).
+          example: "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA..."
+        algorithmeSignature:
+          type: string
+          description: Algorithme cryptographique utilisé par l'AC pour signer le certificat.
+          example: "SHA256withRSA"
+        signatureAc:
+          type: string
+          description: Signature numérique de l'AC émettrice couvrant l'ensemble des champs du certificat (encodée en Base64).
+          example: "f8a9c12e4b701d9e3a..."
+
+    DroitsEntiteAE:
+      type: object
+      required:
+        - nomEntite
+        - droitSignature
+        - droitChiffrement
+        - droitDemandeRevocation
+        - acRattachementId
+      description: Entrée d'annuaire interne d'une Autorité d'Enregistrement (AE) définissant les droits d'un demandeur.
+      properties:
+        nomEntite:
+          type: string
+          example: "alice.martin@dsi.organisation.fr"
+        natureRessource:
+          type: string
+          example: "messagerie"
+        droitSignature:
+          type: boolean
+          description: Autorise l'entité à demander un certificat permettant la signature (`oui`/`non`).
+          example: true
+        droitChiffrement:
+          type: boolean
+          description: Autorise l'entité à demander un certificat permettant le chiffrement (`oui`/`non`).
+          example: true
+        droitDemandeRevocation:
+          type: boolean
+          description: Autorise l'entité à demander la révocation ou la suspension de son certificat (`oui`/`non`).
+          example: true
+        acRattachementId:
+          type: string
+          description: Identifiant de l'AC de niveau 3 correspondant à la direction/service de l'entité.
+          example: "AC-N3-DSI-MESSAGERIE"
+
+    DemandeCertificationRequete:
+      type: object
+      required:
+        - nomEntite
+        - motDePasse
+        - usage
+      properties:
+        nomEntite:
+          type: string
+          description: Identité du demandeur enregistrée dans l'AE.
+          example: "alice.martin@dsi.organisation.fr"
+        motDePasse:
+          type: string
+          format: password
+          description: Mot de passe du demandeur pour authentification auprès de l'AE.
+          example: "SecretP@ss2026!"
+        acCibleId:
+          type: string
+          description: Identifiant de l'AC de niveau 3 cible (optionnel si déduit du rattachement organisationnel dans l'AE).
+          example: "AC-N3-DSI-MESSAGERIE"
+        usage:
+          $ref: '#/components/schemas/UsageCle'
+        clePublique:
+          type: string
+          description: Clé Publique (CP) générée par le Porteur. Obligatoire si `genererBicle` vaut `false`.
+          example: "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA..."
+        genererBicle:
+          type: boolean
+          default: false
+          description: Si `true`, demande à l'AC de générer la biclé (clé publique + clé privée) pour le compte du Porteur.
+
+    DemandeCertificationReponse:
+      type: object
+      required:
+        - demandeId
+        - statutDemande
+        - horodatage
+      properties:
+        demandeId:
+          type: string
+          format: uuid
+          description: Identifiant de corrélation de la demande (`JMSCorrelationID`).
+          example: "6b1f8c20-9a4e-4d1c-8e33-0192837465ab"
+        statutDemande:
+          type: string
+          enum:
+            - EN_ATTENTE_AC
+            - EMISE
+            - REJETEE
+          example: "EMISE"
+        horodatage:
+          type: string
+          format: date-time
+          example: "2026-11-09T09:00:00Z"
+        certificat:
+          $ref: '#/components/schemas/Certificat'
+        clePriveeGeneree:
+          type: string
+          nullable: true
+          description: |
+            Présent uniquement lorsque `genererBicle: true` a été demandé. Contient la clé privée générée par l'AC, transmise une seule fois au Porteur et jamais conservée par l'AC ni par l'AE.
+
+    DemandeRevocationRequete:
+      type: object
+      required:
+        - nomEntite
+        - motDePasse
+        - numeroSerieCertificat
+        - action
+      properties:
+        nomEntite:
+          type: string
+          description: Identité du Porteur demandant la révocation ou la suspension.
+          example: "alice.martin@dsi.organisation.fr"
+        motDePasse:
+          type: string
+          format: password
+          description: Mot de passe du Porteur pour authentification auprès de l'AE.
+        numeroSerieCertificat:
+          type: string
+          description: Numéro de série unique du certificat visé.
+          example: "SN-2026-DSI-000142"
+        action:
+          type: string
+          description: |
+            - `REVOCATION` : invalidation définitive et irréversible avant la date de fin de validité.
+            - `SUSPENSION` : invalidation temporaire et réversible avant la date de fin de validité.
+            - `REACTIVATION` : levée d'une suspension temporaire existante.
+          enum:
+            - REVOCATION
+            - SUSPENSION
+            - REACTIVATION
+        motif:
+          type: string
+          enum:
+            - COMPROMISSION_CLE_PRIVEE
+            - CESSATION_ACTIVITE
+            - CHANGEMENT_AFFILIATION
+            - SUSPENSION_TEMPORAIRE
+            - FIN_SUSPENSION
+            - AUTRE
+          example: "COMPROMISSION_CLE_PRIVEE"
+
+    DemandeRevocationReponse:
+      type: object
+      required:
+        - demandeId
+        - numeroSerieCertificat
+        - actionAppliquee
+        - nouvelEtatCertificat
+        - horodatagePublicationLcr
+      properties:
+        demandeId:
+          type: string
+          format: uuid
+          example: "f47ac10b-58cc-4372-a567-0e02b2c3d479"
+        numeroSerieCertificat:
+          type: string
+          example: "SN-2026-DSI-000142"
+        identifiantAc:
+          type: string
+          example: "AC-N3-DSI-MESSAGERIE"
+        actionAppliquee:
+          type: string
+          enum:
+            - REVOCATION
+            - SUSPENSION
+            - REACTIVATION
+          example: "REVOCATION"
+        nouvelEtatCertificat:
+          $ref: '#/components/schemas/StatutCertificat'
+        horodatagePublicationLcr:
+          type: string
+          format: date-time
+          example: "2026-11-09T09:05:12Z"
+
+    StatutCertificatReponse:
+      type: object
+      required:
+        - numeroSerie
+        - statut
+        - horodatageVerification
+        - identifiantAv
+      properties:
+        numeroSerie:
+          type: string
+          example: "SN-2026-DSI-000142"
+        statut:
+          $ref: '#/components/schemas/StatutCertificat'
+        identifiantAcEmettrice:
+          type: string
+          example: "AC-N3-DSI-MESSAGERIE"
+        motifInvalidation:
+          type: string
+          nullable: true
+          description: Renseigné si le statut est `REVOQUE` ou `SUSPENDU`.
+          example: null
+        dateInvalidation:
+          type: string
+          format: date-time
+          nullable: true
+          example: null
+        horodatageVerification:
+          type: string
+          format: date-time
+          example: "2026-11-09T09:10:00Z"
+        identifiantAv:
+          type: string
+          example: "AV-MESSAGERIE"
+
+    ValidationCertificatRequete:
+      type: object
+      required:
+        - numeroSerieCertificat
+        - usageAttendu
+      properties:
+        numeroSerieCertificat:
+          type: string
+          description: Numéro de série du certificat à valider.
+          example: "SN-2026-DSI-000142"
+        usageAttendu:
+          $ref: '#/components/schemas/UsageCle'
+        sujetAttendu:
+          type: string
+          description: Identité attendue du propriétaire (optionnel, vérifie la correspondance exacte du sujet).
+          example: "alice.martin@dsi.organisation.fr"
+
+    ValidationCertificatReponse:
+      type: object
+      required:
+        - valide
+        - numeroSerieCertificat
+        - detailsEtapes
+        - cheminCertification
+        - horodatageValidation
+      properties:
+        valide:
+          type: boolean
+          description: Vaut `true` si et seulement si les 4 étapes du processus de validation sont satisfaites.
+          example: true
+        numeroSerieCertificat:
+          type: string
+          example: "SN-2026-DSI-000142"
+        statutCourant:
+          $ref: '#/components/schemas/StatutCertificat'
+        detailsEtapes:
+          type: object
+          required:
+            - etape1PeriodeValiditeOk
+            - etape2SignatureEtCheminOk
+            - etape3StatutAvOk
+            - etape4PolitiqueUsageOk
+          properties:
+            etape1PeriodeValiditeOk:
+              type: boolean
+              description: Étape 1 — Contrôle de la période de validité (dates de début et de fin).
+              example: true
+            etape2SignatureEtCheminOk:
+              type: boolean
+              description: Étape 2 — Vérification des signatures et du chemin de certification jusqu'à l'AC Racine (Niveau 1).
+              example: true
+            etape3StatutAvOk:
+              type: boolean
+              description: Étape 3 — Contrôle de l'état de non-révocation/non-suspension du certificat et des AC signataires auprès de l'AV.
+              example: true
+            etape4PolitiqueUsageOk:
+              type: boolean
+              description: Étape 4 — Contrôle de la compatibilité de l'usage du certificat avec l'opération demandée.
+              example: true
+            messageDiagnostic:
+              type: string
+              example: "Certificat valide : période active, chaîne de confiance vérifiée sur 3 niveaux (AC-N3-DSI-MESSAGERIE -> AC-N2-DSI -> AC-N1-RACINE), statut VALIDE, usage SIGNATURE_ET_CHIFFREMENT conforme."
+        cheminCertification:
+          type: array
+          description: Liste ordonnée des identifiants d'AC et certificats composant le chemin de confiance vérifié.
+          items:
+            type: string
+          example:
+            - "SN-2026-DSI-000142 (Sujet: alice.martin@dsi.organisation.fr)"
+            - "SN-AC-N3-DSI-MSG (AC-N3-DSI-MESSAGERIE)"
+            - "SN-AC-N2-DSI (AC-N2-DSI)"
+            - "SN-AC-N1-ROOT (AC-N1-RACINE - Auto-signé)"
+        horodatageValidation:
+          type: string
+          format: date-time
+          example: "2026-11-09T09:10:05Z"
+
+    CheminCertificationReponse:
+      type: object
+      required:
+        - numeroSerieCible
+        - profondeurHierarchie
+        - chaineCertificats
+      properties:
+        numeroSerieCible:
+          type: string
+          example: "SN-2026-DSI-000142"
+        profondeurHierarchie:
+          type: integer
+          description: Nombre de niveaux d'AC dans le chemin de certification (typiquement 3).
+          example: 3
+        chaineCertificats:
+          type: array
+          description: |
+            Chaîne ordonnée de certificats :
+            - Index 0 : Certificat du Porteur final
+            - Index 1 : Certificat de l'AC Fille de Niveau 3 (Service)
+            - Index 2 : Certificat de l'AC Fille de Niveau 2 (Direction)
+            - Index 3 : Certificat auto-signé de l'AC Racine de Niveau 1
+          items:
+            $ref: '#/components/schemas/Certificat'
+
+    AutoriteCertificationInfo:
+      type: object
+      required:
+        - acId
+        - nomOrganisationnel
+        - niveau
+        - certificatAc
+      properties:
+        acId:
+          type: string
+          example: "AC-N3-DSI-MESSAGERIE"
+        nomOrganisationnel:
+          type: string
+          example: "Direction des Systèmes d'Information — Service Messagerie"
+        niveau:
+          type: integer
+          description: 1 = AC Racine, 2 = AC Direction, 3 = AC Service.
+          example: 3
+        acParenteId:
+          type: string
+          nullable: true
+          description: Identifiant de l'AC parente (null pour l'AC Racine de niveau 1).
+          example: "AC-N2-DSI"
+        certificatAc:
+          $ref: '#/components/schemas/Certificat'
+
+    EntreeLcr:
+      type: object
+      required:
+        - numeroSerieCertificat
+        - statut
+        - dateInvalidation
+        - motif
+      properties:
+        numeroSerieCertificat:
+          type: string
+          example: "SN-2026-DSI-000098"
+        statut:
+          type: string
+          enum:
+            - REVOQUE
+            - SUSPENDU
+          example: "REVOQUE"
+        dateInvalidation:
+          type: string
+          format: date-time
+          example: "2026-10-15T14:22:00Z"
+        motif:
+          type: string
+          example: "COMPROMISSION_CLE_PRIVEE"
+
+    ListeCertificatsRevoques:
+      type: object
+      required:
+        - identifiantAc
+        - numeroVersionLcr
+        - dateEmission
+        - prochaineMiseAJour
+        - entrees
+        - signatureAc
+      properties:
+        identifiantAc:
+          type: string
+          example: "AC-N3-DSI-MESSAGERIE"
+        numeroVersionLcr:
+          type: integer
+          example: 14
+        dateEmission:
+          type: string
+          format: date-time
+          example: "2026-11-09T09:05:12Z"
+        prochaineMiseAJour:
+          type: string
+          format: date-time
+          example: "2026-11-10T09:05:12Z"
+        entrees:
+          type: array
+          items:
+            $ref: '#/components/schemas/EntreeLcr'
+        signatureAc:
+          type: string
+          description: Signature numérique de l'AC garantissant l'authenticité et l'intégrité de la LCR.
+          example: "7b3e91a04d2c8f..."
+
+    ErreurApi:
+      type: object
+      required:
+        - code
+        - message
+        - horodatage
+      properties:
+        code:
+          type: string
+          example: "DROITS_INSUFFISANTS"
+        message:
+          type: string
+          example: "L'entité ne dispose pas du droit droit_chiffrement requis pour l'usage demandé."
+        horodatage:
+          type: string
+          format: date-time
+          example: "2026-11-09T09:00:00Z"
+        chemin:
+          type: string
+          example: "/api/v1/ae/messagerie/demandes-certification"
+
+  responses:
+    ErreurRequeteInvalide:
+      description: Paramètres de la requête invalides ou incomplets.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErreurApi'
+    ErreurNonAuthentifie:
+      description: Échec de l'authentification du demandeur auprès de l'AE (identifiant ou mot de passe incorrect).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErreurApi'
+    ErreurDroitsInsuffisants:
+      description: Le demandeur est authentifié mais ne possède pas les droits requis dans l'AE (`droit_signature`, `droit_chiffrement` ou `droit_de_demande_de_revocation`).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErreurApi'
+    ErreurRessourceIntrouvable:
+      description: Certificat, autorité ou entité introuvable dans le domaine de confiance.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErreurApi'
