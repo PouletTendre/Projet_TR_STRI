@@ -45,7 +45,8 @@ export type NatureRessource =
   | 'messagerie'
   | 'routeurs'
   | 'services'
-  | 'utilisateurs';
+  | 'utilisateurs'
+  | (string & {});
 
 export interface DroitsEntiteAE {
   nomEntite: string;
