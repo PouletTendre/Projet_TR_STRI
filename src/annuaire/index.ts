@@ -3,6 +3,9 @@ import type {
   Certificat,
   AutoriteCertificationInfo,
   CheminCertificationReponse,
+  ListeCertificatsRevoques,
+  EntreeLcr,
+  PublicationLcrPayload,
   ErreurApi,
   UsageCle,
   RestRequest,
@@ -16,7 +19,9 @@ export class ServicePublication {
   private broker: InMemoryJmsBroker;
   private certificatsParNumeroSerie = new Map<string, Certificat>();
   private autoritesParId = new Map<string, AutoriteCertificationInfo>();
+  private lcrsParAcId = new Map<string, ListeCertificatsRevoques>();
   private unsubscribeTopic: () => void;
+  private unsubscribeLcr: () => void;
 
   constructor(broker: InMemoryJmsBroker) {
     this.broker = broker;
@@ -24,12 +29,59 @@ export class ServicePublication {
       'topic.pki.publications.certificats',
       (msg) => this.onCertificatPublie(msg)
     );
+    this.unsubscribeLcr = this.broker.subscribe<PublicationLcrPayload>(
+      'topic.pki.publications.lcr',
+      (msg) => this.onLcrPublie(msg)
+    );
   }
 
   public destroy(): void {
     if (this.unsubscribeTopic) {
       this.unsubscribeTopic();
     }
+    if (this.unsubscribeLcr) {
+      this.unsubscribeLcr();
+    }
+  }
+
+  public onLcrPublie(message: JmsTextMessage<PublicationLcrPayload>): void {
+    const payload = message.payload;
+    if (!payload) return;
+
+    if (payload.lcr) {
+      this.lcrsParAcId.set(payload.lcr.identifiantAc, payload.lcr);
+      return;
+    }
+
+    if (payload.identifiantAc) {
+      const entrees: EntreeLcr[] = (payload.entreesActives ?? []).map((e) => ({
+        numeroSerieCertificat: e.numeroSerieCertificat,
+        statut: e.statut as 'REVOQUE' | 'SUSPENDU',
+        dateInvalidation: e.dateInvalidation,
+        motif: e.motif ?? '',
+      }));
+
+      this.lcrsParAcId.set(payload.identifiantAc, {
+        identifiantAc: payload.identifiantAc,
+        numeroVersionLcr: payload.numeroVersionLcr ?? 1,
+        dateEmission: payload.dateEmission ?? new Date().toISOString(),
+        prochaineMiseAJour: payload.prochaineMiseAJour ?? new Date().toISOString(),
+        entrees,
+        signatureAc: payload.signatureAc ?? '',
+      });
+    }
+  }
+
+  public getLcrParAutorite(acId: string): ListeCertificatsRevoques | null {
+    return this.lcrsParAcId.get(acId) ?? null;
+  }
+
+  public getLcrConsolidee(): ListeCertificatsRevoques[] {
+    return Array.from(this.lcrsParAcId.values());
+  }
+
+  public enregistrerLcr(lcr: ListeCertificatsRevoques): void {
+    this.lcrsParAcId.set(lcr.identifiantAc, lcr);
   }
 
   public onCertificatPublie(message: JmsTextMessage<Certificat>): void {
@@ -242,6 +294,41 @@ export class ServicePublication {
         status: 200,
         headers: { 'Content-Type': 'application/json' },
         body: results,
+      };
+    }
+
+    // 5. GET /annuaire/autorites/{acId}/lcr
+    const lcrAcMatch = cleanPath.match(/^\/annuaire\/autorites\/([^/]+)\/lcr$/);
+    if (req.method === 'GET' && lcrAcMatch) {
+      const acId = decodeURIComponent(lcrAcMatch[1]);
+      const lcr = this.getLcrParAutorite(acId);
+      if (!lcr) {
+        const err: ErreurApi = {
+          code: 'LCR_INTROUVABLE',
+          message: `Aucune LCR trouvée pour l'Autorité de Certification '${acId}'.`,
+          horodatage: new Date().toISOString(),
+          chemin: req.path,
+        };
+        return {
+          status: 404,
+          headers: { 'Content-Type': 'application/json' },
+          body: err,
+        };
+      }
+      return {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+        body: lcr,
+      };
+    }
+
+    // 6. GET /annuaire/lcr (Consolidated LCR)
+    if (req.method === 'GET' && cleanPath === '/annuaire/lcr') {
+      const lcrs = this.getLcrConsolidee();
+      return {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+        body: lcrs,
       };
     }
 

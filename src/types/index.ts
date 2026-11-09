@@ -130,9 +130,44 @@ export interface ValidationCertificatReponse {
   horodatageValidation: string;
 }
 
+export type ActionRevocation = 'REVOCATION' | 'SUSPENSION' | 'REACTIVATION';
+
+export interface DemandeRevocationRequete {
+  nomEntite: string;
+  motDePasse: string;
+  numeroSerieCertificat: string;
+  action: ActionRevocation;
+  motif?: string;
+}
+
+export interface DemandeRevocationReponse {
+  demandeId: string;
+  numeroSerieCertificat: string;
+  identifiantAc?: string;
+  actionAppliquee: ActionRevocation;
+  nouvelEtatCertificat: StatutCertificat;
+  horodatagePublicationLcr: string;
+}
+
+export interface EntreeLcr {
+  numeroSerieCertificat: string;
+  statut: 'REVOQUE' | 'SUSPENDU';
+  dateInvalidation: string;
+  motif: string;
+}
+
+export interface ListeCertificatsRevoques {
+  identifiantAc: string;
+  numeroVersionLcr: number;
+  dateEmission: string;
+  prochaineMiseAJour: string;
+  entrees: EntreeLcr[];
+  signatureAc: string;
+}
+
 export interface LcrEvenementDeclencheur {
   numeroSerieCertificat: string;
-  action: 'REVOCATION' | 'SUSPENSION' | 'REACTIVATION';
+  action: ActionRevocation;
   nouveauStatut: StatutCertificat;
   motif?: string;
   dateEffet: string;
@@ -152,6 +187,7 @@ export interface PublicationLcrPayload {
   prochaineMiseAJour?: string;
   evenementDeclencheur?: LcrEvenementDeclencheur;
   entreesActives?: LcrEntreeActive[];
+  lcr?: ListeCertificatsRevoques;
   signatureAc?: string;
 }
 

@@ -1,5 +1,5 @@
 import crypto from 'node:crypto';
-import type { Certificat } from '../types/index.js';
+import type { Certificat, ListeCertificatsRevoques } from '../types/index.js';
 
 export interface RsaKeyPair {
   publicKeyPem: string;
@@ -97,6 +97,57 @@ export function verifyCertificatSignature(
     verifier.update(dataToVerify);
     verifier.end();
     return verifier.verify(publicKeyPem, cert.signatureAc, 'base64');
+  } catch {
+    return false;
+  }
+}
+
+export function serializeLcrDataToSign(
+  lcrData: Omit<ListeCertificatsRevoques, 'signatureAc'>
+): Buffer {
+  const normalized = {
+    dateEmission: lcrData.dateEmission,
+    entrees: (lcrData.entrees ?? []).map((e) => ({
+      dateInvalidation: e.dateInvalidation,
+      motif: e.motif,
+      numeroSerieCertificat: e.numeroSerieCertificat,
+      statut: e.statut,
+    })).sort((a, b) => a.numeroSerieCertificat.localeCompare(b.numeroSerieCertificat)),
+    identifiantAc: lcrData.identifiantAc,
+    numeroVersionLcr: lcrData.numeroVersionLcr,
+    prochaineMiseAJour: lcrData.prochaineMiseAJour,
+  };
+
+  return Buffer.from(JSON.stringify(normalized), 'utf-8');
+}
+
+export function signLcr(
+  lcrData: Omit<ListeCertificatsRevoques, 'signatureAc'>,
+  signerPrivateKeyPem: string
+): ListeCertificatsRevoques {
+  const dataToSign = serializeLcrDataToSign(lcrData);
+  const signer = crypto.createSign('SHA256');
+  signer.update(dataToSign);
+  signer.end();
+  const signatureBase64 = signer.sign(signerPrivateKeyPem, 'base64');
+
+  return {
+    ...lcrData,
+    signatureAc: signatureBase64,
+  };
+}
+
+export function verifyLcrSignature(
+  lcr: ListeCertificatsRevoques,
+  signerPublicKeyPemOrBase64: string
+): boolean {
+  try {
+    const publicKeyPem = base64ToPublicKeyPem(signerPublicKeyPemOrBase64);
+    const dataToVerify = serializeLcrDataToSign(lcr);
+    const verifier = crypto.createVerify('SHA256');
+    verifier.update(dataToVerify);
+    verifier.end();
+    return verifier.verify(publicKeyPem, lcr.signatureAc, 'base64');
   } catch {
     return false;
   }

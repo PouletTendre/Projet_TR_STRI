@@ -1,6 +1,8 @@
+import crypto from 'node:crypto';
 import {
   generateRsaKeyPair,
   signCertificat,
+  signLcr,
   type RsaKeyPair,
 } from '../crypto/index.js';
 import { InMemoryJmsBroker, type JmsTextMessage } from '../broker/index.js';
@@ -9,6 +11,11 @@ import type {
   Certificat,
   AutoriteCertificationInfo,
   UsageCle,
+  ActionRevocation,
+  StatutCertificat,
+  EntreeLcr,
+  ListeCertificatsRevoques,
+  DemandeRevocationReponse,
 } from '../types/index.js';
 
 export interface CreateRootOptions {
@@ -56,6 +63,9 @@ export class AutoriteCertification {
   public readonly certificat: Certificat;
   public readonly broker: InMemoryJmsBroker;
   public readonly certificatsValides = new Map<string, Certificat>();
+  public readonly statutCertificats = new Map<string, StatutCertificat>();
+  private entreesLcr = new Map<string, EntreeLcr>();
+  private lcrVersion = 0;
   private compteurSerie = 1;
 
   constructor(params: {
@@ -76,6 +86,7 @@ export class AutoriteCertification {
     this.broker = params.broker;
 
     this.certificatsValides.set(this.certificat.numeroSerie, this.certificat);
+    this.statutCertificats.set(this.certificat.numeroSerie, 'VALIDE');
     this.demarrerEcouteJms();
   }
 
@@ -90,6 +101,188 @@ export class AutoriteCertification {
       `queue.pki.ac.${this.id}.demandes`,
       (message) => this.traiterDemandeQueue(message)
     );
+  }
+
+  public getLcr(): ListeCertificatsRevoques {
+    const now = new Date();
+    const nextUpdate = new Date(now.getTime() + 24 * 60 * 60 * 1000);
+    const entrees = Array.from(this.entreesLcr.values()).sort((a, b) =>
+      a.numeroSerieCertificat.localeCompare(b.numeroSerieCertificat)
+    );
+    const lcrData: Omit<ListeCertificatsRevoques, 'signatureAc'> = {
+      identifiantAc: this.id,
+      numeroVersionLcr: this.lcrVersion,
+      dateEmission: now.toISOString(),
+      prochaineMiseAJour: nextUpdate.toISOString(),
+      entrees,
+    };
+    return signLcr(lcrData, this.keyPair.privateKeyPem);
+  }
+
+  public revoquerCertificat(numeroSerie: string, motif?: string): DemandeRevocationReponse {
+    const res = this.changerStatutCertificat(numeroSerie, 'REVOCATION', motif);
+    if (!res.succes || !res.reponse) {
+      throw new Error(res.messageErreur ?? 'Échec de la révocation du certificat');
+    }
+    return res.reponse;
+  }
+
+  public changerStatutCertificat(
+    numeroSerie: string,
+    action: ActionRevocation,
+    motif?: string,
+    demandeId?: string
+  ): {
+    succes: boolean;
+    statusCode: number;
+    codeErreur?: string;
+    messageErreur?: string;
+    reponse?: DemandeRevocationReponse;
+  } {
+    const cert = this.certificatsValides.get(numeroSerie);
+    if (!cert) {
+      return {
+        succes: false,
+        statusCode: 404,
+        codeErreur: 'CERTIFICAT_INTROUVABLE',
+        messageErreur: `Le certificat '${numeroSerie}' est introuvable auprès de l'AC '${this.id}'.`,
+      };
+    }
+
+    // Expiration check
+    if (new Date(cert.dateFinValidite).getTime() < Date.now()) {
+      return {
+        succes: false,
+        statusCode: 409,
+        codeErreur: 'TRANSITION_INVALIDE',
+        messageErreur: "Impossible d'opérer sur un certificat expiré.",
+      };
+    }
+
+    const currentStatut = this.statutCertificats.get(numeroSerie) ?? 'VALIDE';
+
+    if (action === 'REVOCATION') {
+      if (currentStatut === 'REVOQUE') {
+        return {
+          succes: false,
+          statusCode: 409,
+          codeErreur: 'TRANSITION_INVALIDE',
+          messageErreur: 'Le certificat est déjà révoqué définitivement.',
+        };
+      }
+    } else if (action === 'SUSPENSION') {
+      if (currentStatut === 'REVOQUE') {
+        return {
+          succes: false,
+          statusCode: 409,
+          codeErreur: 'TRANSITION_INVALIDE',
+          messageErreur: 'Impossible de suspendre un certificat déjà révoqué définitivement.',
+        };
+      }
+      if (currentStatut === 'SUSPENDU') {
+        return {
+          succes: false,
+          statusCode: 409,
+          codeErreur: 'TRANSITION_INVALIDE',
+          messageErreur: 'Le certificat est déjà suspendu.',
+        };
+      }
+    } else if (action === 'REACTIVATION') {
+      if (currentStatut === 'REVOQUE') {
+        return {
+          succes: false,
+          statusCode: 409,
+          codeErreur: 'TRANSITION_INVALIDE',
+          messageErreur:
+            'Impossible de réactiver un certificat révoqué définitivement : la révocation est irréversible.',
+        };
+      }
+      if (currentStatut === 'VALIDE') {
+        return {
+          succes: false,
+          statusCode: 409,
+          codeErreur: 'TRANSITION_INVALIDE',
+          messageErreur: "Impossible de réactiver un certificat qui n'est pas suspendu.",
+        };
+      }
+    }
+
+    const now = new Date();
+    const nouveauStatut: StatutCertificat =
+      action === 'REACTIVATION'
+        ? 'VALIDE'
+        : action === 'SUSPENSION'
+        ? 'SUSPENDU'
+        : 'REVOQUE';
+
+    this.lcrVersion++;
+    this.statutCertificats.set(numeroSerie, nouveauStatut);
+
+    if (nouveauStatut === 'REVOQUE') {
+      this.entreesLcr.set(numeroSerie, {
+        numeroSerieCertificat: numeroSerie,
+        statut: 'REVOQUE',
+        dateInvalidation: now.toISOString(),
+        motif: motif ?? 'REVOCATION',
+      });
+    } else if (nouveauStatut === 'SUSPENDU') {
+      this.entreesLcr.set(numeroSerie, {
+        numeroSerieCertificat: numeroSerie,
+        statut: 'SUSPENDU',
+        dateInvalidation: now.toISOString(),
+        motif: motif ?? 'SUSPENSION_TEMPORAIRE',
+      });
+    } else if (nouveauStatut === 'VALIDE') {
+      this.entreesLcr.delete(numeroSerie);
+    }
+
+    const signedLcr = this.getLcr();
+
+    this.broker.publish('topic.pki.publications.lcr', {
+      headers: {
+        type_message: 'PUBLICATION_LCR',
+        ac_emettrice_id: this.id,
+        numero_serie_affecte: cert.numeroSerie,
+        nouveau_statut: nouveauStatut,
+      },
+      payload: {
+        identifiantAc: this.id,
+        numeroVersionLcr: signedLcr.numeroVersionLcr,
+        dateEmission: signedLcr.dateEmission,
+        prochaineMiseAJour: signedLcr.prochaineMiseAJour,
+        evenementDeclencheur: {
+          numeroSerieCertificat: cert.numeroSerie,
+          action,
+          nouveauStatut,
+          motif:
+            motif ??
+            (action === 'REVOCATION'
+              ? 'REVOCATION'
+              : action === 'SUSPENSION'
+              ? 'SUSPENSION_TEMPORAIRE'
+              : 'FIN_SUSPENSION'),
+          dateEffet: now.toISOString(),
+        },
+        entreesActives: Array.from(this.entreesLcr.values()),
+        lcr: signedLcr,
+        signatureAc: signedLcr.signatureAc,
+      },
+    });
+
+    const reponse: DemandeRevocationReponse = {
+      demandeId: demandeId ?? crypto.randomUUID(),
+      numeroSerieCertificat: cert.numeroSerie,
+      identifiantAc: this.id,
+      actionAppliquee: action,
+      nouvelEtatCertificat: nouveauStatut,
+      horodatagePublicationLcr: signedLcr.dateEmission,
+    };
+
+    return {
+      succes: true,
+      statusCode: 200,
+      reponse,
+    };
   }
 
   public traiterDemandeQueue(message: JmsTextMessage): void {
@@ -137,6 +330,55 @@ export class AutoriteCertification {
           },
         });
       }
+    } else if (typeMessage === 'DEMANDE_REVOCATION') {
+      const payload = message.payload as any;
+      const result = this.changerStatutCertificat(
+        payload.numeroSerieCertificat,
+        payload.action,
+        payload.motif,
+        correlationId
+      );
+
+      if (replyTo) {
+        if (result.succes && result.reponse) {
+          this.broker.sendToQueue(replyTo, {
+            headers: {
+              JMSCorrelationID: correlationId,
+              type_message: 'REPONSE_REVOCATION',
+              statut_traitement: 'SUCCES',
+              ac_emettrice_id: this.id,
+            },
+            payload: {
+              demandeId: correlationId,
+              statut: 'SUCCES',
+              numeroSerieCertificat: result.reponse.numeroSerieCertificat,
+              identifiantAc: this.id,
+              actionAppliquee: result.reponse.actionAppliquee,
+              nouvelEtatCertificat: result.reponse.nouvelEtatCertificat,
+              numeroVersionLcr: this.lcrVersion,
+              horodatagePublicationLcr: result.reponse.horodatagePublicationLcr,
+            },
+          });
+        } else {
+          this.broker.sendToQueue(replyTo, {
+            headers: {
+              JMSCorrelationID: correlationId,
+              type_message: 'REPONSE_REVOCATION',
+              statut_traitement: 'REJET',
+              ac_emettrice_id: this.id,
+            },
+            payload: {
+              demandeId: correlationId,
+              statut: 'REJET',
+              statusCode: result.statusCode,
+              codeErreur: result.codeErreur,
+              messageErreur: result.messageErreur,
+              numeroSerieCertificat: payload.numeroSerieCertificat,
+              identifiantAc: this.id,
+            },
+          });
+        }
+      }
     }
   }
 
@@ -183,6 +425,7 @@ export class AutoriteCertification {
 
     const signedCert = signCertificat(certData, this.keyPair.privateKeyPem);
     this.certificatsValides.set(signedCert.numeroSerie, signedCert);
+    this.statutCertificats.set(signedCert.numeroSerie, 'VALIDE');
     this.publierCertificat(signedCert);
     return signedCert;
 
@@ -208,6 +451,8 @@ export class AutoriteCertification {
     };
 
     const signedCert = signCertificat(certData, this.keyPair.privateKeyPem);
+    this.certificatsValides.set(signedCert.numeroSerie, signedCert);
+    this.statutCertificats.set(signedCert.numeroSerie, 'VALIDE');
     this.publierCertificat(signedCert);
 
     return new AutoriteCertification({

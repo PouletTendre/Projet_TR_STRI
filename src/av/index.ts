@@ -110,6 +110,17 @@ export class AutoriteValidation {
       }
     }
 
+    if (payload?.lcr?.entrees && Array.isArray(payload.lcr.entrees)) {
+      for (const entree of payload.lcr.entrees) {
+        this.mettreAJourStatut(
+          entree.numeroSerieCertificat,
+          entree.statut,
+          entree.motif,
+          entree.dateInvalidation
+        );
+      }
+    }
+
     const headerSerie = message.headers?.numero_serie_affecte as
       | string
       | undefined;
@@ -279,10 +290,16 @@ export class AutoriteValidation {
 
     // Step 3: Contrôle de l'état du certificat et des AC auprès de l'AV
     let etape3StatutAvOk = true;
+    let etape3Cause = '';
     for (const cert of chaine) {
       const rep = this.obtenirStatut(cert.numeroSerie);
       if (rep.statut !== 'VALIDE') {
         etape3StatutAvOk = false;
+        if (cert.numeroSerie === leafCert.numeroSerie) {
+          etape3Cause = `statut non valide : ${rep.statut}`;
+        } else {
+          etape3Cause = `statut de l'AC '${cert.sujet}' non valide : ${rep.statut}`;
+        }
         break;
       }
     }
@@ -329,7 +346,7 @@ export class AutoriteValidation {
         );
       }
       if (!etape3StatutAvOk) {
-        causes.push(`Étape 3 (statut non valide : ${statutCourant})`);
+        causes.push(`Étape 3 (${etape3Cause || `statut non valide : ${statutCourant}`})`);
       }
       if (!etape4PolitiqueUsageOk) {
         causes.push(

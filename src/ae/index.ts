@@ -1,5 +1,6 @@
 import crypto from 'node:crypto';
 import { InMemoryJmsBroker, type JmsTextMessage } from '../broker/index.js';
+import type { ServicePublication } from '../annuaire/index.js';
 import type {
   NatureRessource,
   DroitsEntiteAE,
@@ -7,6 +8,9 @@ import type {
   StatutDemandeCertification,
   DemandeCertificationRequete,
   DemandeCertificationReponse,
+  DemandeRevocationRequete,
+  DemandeRevocationReponse,
+  Certificat,
   RestRequest,
   RestResponse,
   ErreurApi,
@@ -31,8 +35,11 @@ export class AutoriteEnregistrement {
   public readonly id: string;
   public readonly nature: NatureRessource;
   public readonly broker: InMemoryJmsBroker;
+  public readonly annuaire?: ServicePublication;
   private entites = new Map<string, EntiteAERegistre>();
   private demandesParId = new Map<string, DemandeCertificationReponse>();
+  private certificatsConnus = new Map<string, Certificat>();
+  private unsubscribeCertificats: () => void;
   private pendingReplies = new Map<
     string,
     {
@@ -46,11 +53,36 @@ export class AutoriteEnregistrement {
     id: string;
     nature: NatureRessource;
     broker: InMemoryJmsBroker;
+    annuaire?: ServicePublication;
   }) {
     this.id = options.id;
     this.nature = options.nature;
     this.broker = options.broker;
+    this.annuaire = options.annuaire;
     this.demarrerEcouteReponses();
+
+    this.unsubscribeCertificats = this.broker.subscribe<Certificat>(
+      'topic.pki.publications.certificats',
+      (msg) => {
+        if (msg.payload?.numeroSerie) {
+          this.certificatsConnus.set(msg.payload.numeroSerie, msg.payload);
+        }
+      }
+    );
+  }
+
+  public destroy(): void {
+    if (this.unsubscribeCertificats) {
+      this.unsubscribeCertificats();
+    }
+  }
+
+  public getCertificat(numeroSerie: string): Certificat | undefined {
+    return (
+      this.certificatsConnus.get(numeroSerie) ??
+      this.annuaire?.getCertificatParNumeroSerie(numeroSerie) ??
+      undefined
+    );
   }
 
   private demarrerEcouteReponses(): void {
@@ -144,6 +176,90 @@ export class AutoriteEnregistrement {
             horodatageVerification: new Date().toISOString(),
             droitSignatureVerifie: entite.droitSignature,
             droitChiffrementVerifie: entite.droitChiffrement,
+          },
+        },
+      });
+    });
+  }
+
+  private async traiterDemandeRevocation(
+    reqBody: DemandeRevocationRequete,
+    entite: EntiteAERegistre,
+    cert: Certificat
+  ): Promise<RestResponse> {
+    const demandeId = crypto.randomUUID();
+    const acCibleId = cert.identifiantAcEmettrice;
+
+    return new Promise<RestResponse>((resolve) => {
+      const timer = setTimeout(() => {
+        this.pendingReplies.delete(demandeId);
+        const err: ErreurApi = {
+          code: 'AC_INDISPONIBLE',
+          message: `L'AC cible '${acCibleId}' n'a pas répondu dans le délai imparti.`,
+          horodatage: new Date().toISOString(),
+          chemin: `/ae/${this.nature}/demandes-revocation`,
+        };
+        resolve({
+          status: 504,
+          headers: { 'Content-Type': 'application/json' },
+          body: err,
+        });
+      }, 5000);
+
+      this.pendingReplies.set(demandeId, {
+        resolve: (payload: any) => {
+          if (payload.statut === 'SUCCES') {
+            const reponse: DemandeRevocationReponse = {
+              demandeId,
+              numeroSerieCertificat: payload.numeroSerieCertificat,
+              identifiantAc: payload.identifiantAc,
+              actionAppliquee: payload.actionAppliquee,
+              nouvelEtatCertificat: payload.nouvelEtatCertificat,
+              horodatagePublicationLcr: payload.horodatagePublicationLcr,
+            };
+            resolve({
+              status: 200,
+              headers: { 'Content-Type': 'application/json' },
+              body: reponse,
+            });
+          } else {
+            const statusCode = payload.statusCode ?? 409;
+            const err: ErreurApi = {
+              code: payload.codeErreur ?? 'TRANSITION_INVALIDE',
+              message: payload.messageErreur ?? "Transition d'état invalide.",
+              horodatage: new Date().toISOString(),
+              chemin: `/ae/${this.nature}/demandes-revocation`,
+            };
+            resolve({
+              status: statusCode,
+              headers: { 'Content-Type': 'application/json' },
+              body: err,
+            });
+          }
+        },
+        reject: () => {},
+        timer,
+      });
+
+      // Dispatch to JMS queue queue.pki.ac.<acCibleId>.demandes
+      this.broker.sendToQueue(`queue.pki.ac.${acCibleId}.demandes`, {
+        headers: {
+          JMSCorrelationID: demandeId,
+          JMSReplyTo: `queue.pki.ae.${this.id}.reponses`,
+          type_message: 'DEMANDE_REVOCATION',
+          action_revocation: reqBody.action,
+          ae_emettrice_id: this.id,
+        },
+        payload: {
+          demandeId,
+          numeroSerieCertificat: reqBody.numeroSerieCertificat,
+          sujetDemandeur: entite.nomEntite,
+          action: reqBody.action,
+          motif: reqBody.motif,
+          aeAuthentification: {
+            aeId: this.id,
+            horodatageVerification: new Date().toISOString(),
+            droitDemandeRevocationVerifie: true,
           },
         },
       });
@@ -377,7 +493,114 @@ export class AutoriteEnregistrement {
       };
     }
 
+    // 4. POST /ae/{nature}/demandes-revocation
+    if (
+      req.method === 'POST' &&
+      cleanPath === `/ae/${this.nature}/demandes-revocation`
+    ) {
+      const body = req.body as Partial<DemandeRevocationRequete> | undefined;
+      if (
+        !body ||
+        typeof body !== 'object' ||
+        !body.nomEntite ||
+        !body.motDePasse ||
+        !body.numeroSerieCertificat ||
+        !body.action ||
+        !['REVOCATION', 'SUSPENSION', 'REACTIVATION'].includes(body.action)
+      ) {
+        const err: ErreurApi = {
+          code: 'REQUETE_INVALIDE',
+          message:
+            'Paramètres de demande de révocation manquants ou invalides (nomEntite, motDePasse, numeroSerieCertificat, action requis).',
+          horodatage: new Date().toISOString(),
+          chemin: req.path,
+        };
+        return {
+          status: 400,
+          headers: { 'Content-Type': 'application/json' },
+          body: err,
+        };
+      }
 
+      // Authenticate entity
+      const entite = this.getEntite(body.nomEntite);
+      if (!entite || !this.verifierAuthentification(body.nomEntite, body.motDePasse)) {
+        const err: ErreurApi = {
+          code: 'NON_AUTHENTIFIE',
+          message: `Authentification échouée pour l'entité '${body.nomEntite}'.`,
+          horodatage: new Date().toISOString(),
+          chemin: req.path,
+        };
+        return {
+          status: 401,
+          headers: { 'Content-Type': 'application/json' },
+          body: err,
+        };
+      }
+
+      // Check droitDemandeRevocation
+      if (!entite.droitDemandeRevocation) {
+        const err: ErreurApi = {
+          code: 'DROITS_INSUFFISANTS',
+          message: `L'entité '${body.nomEntite}' ne dispose pas du droit de demande de révocation ('droitDemandeRevocation=false').`,
+          horodatage: new Date().toISOString(),
+          chemin: req.path,
+        };
+        return {
+          status: 403,
+          headers: { 'Content-Type': 'application/json' },
+          body: err,
+        };
+      }
+
+      // Check certificate existence
+      const cert = this.getCertificat(body.numeroSerieCertificat);
+      if (!cert) {
+        const err: ErreurApi = {
+          code: 'CERTIFICAT_INTROUVABLE',
+          message: `Le certificat avec le numéro de série '${body.numeroSerieCertificat}' est introuvable.`,
+          horodatage: new Date().toISOString(),
+          chemin: req.path,
+        };
+        return {
+          status: 404,
+          headers: { 'Content-Type': 'application/json' },
+          body: err,
+        };
+      }
+
+      // Check certificate ownership
+      if (cert.sujet !== entite.nomEntite) {
+        const err: ErreurApi = {
+          code: 'DROITS_INSUFFISANTS',
+          message: `L'entité '${body.nomEntite}' n'est pas le propriétaire (sujet) du certificat '${body.numeroSerieCertificat}'.`,
+          horodatage: new Date().toISOString(),
+          chemin: req.path,
+        };
+        return {
+          status: 403,
+          headers: { 'Content-Type': 'application/json' },
+          body: err,
+        };
+      }
+
+      // Check expiration
+      if (new Date(cert.dateFinValidite).getTime() < Date.now()) {
+        const err: ErreurApi = {
+          code: 'TRANSITION_INVALIDE',
+          message: "Impossible d'opérer sur un certificat expiré.",
+          horodatage: new Date().toISOString(),
+          chemin: req.path,
+        };
+        return {
+          status: 409,
+          headers: { 'Content-Type': 'application/json' },
+          body: err,
+        };
+      }
+
+      return this.traiterDemandeRevocation(body as DemandeRevocationRequete, entite, cert);
+    }
 
     const notFound: ErreurApi = {
       code: 'RESSOURCE_INTROUVABLE',
@@ -448,7 +671,8 @@ export class ServiceAutoriteEnregistrement {
 }
 
 export function bootstrapAutoritesEnregistrement(
-  broker: InMemoryJmsBroker
+  broker: InMemoryJmsBroker,
+  annuaire?: ServicePublication
 ): ServiceAutoriteEnregistrement {
   const service = new ServiceAutoriteEnregistrement(broker);
 
@@ -458,6 +682,7 @@ export function bootstrapAutoritesEnregistrement(
       id: `AE-${nature.toUpperCase()}`,
       nature,
       broker,
+      annuaire,
     });
     service.enregistrerAe(ae);
   }
