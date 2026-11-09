@@ -1,0 +1,23 @@
+{
+  "name": "projet_tr_stri",
+  "version": "1.0.0",
+  "description": "Conception d'une **Infrastructure à Clés Publiques (ICP / PKI)** hiérarchique à 3 niveaux et d'une application de **Messagerie Texte Sécurisée** (« chat ») déployées au sein d'un domaine de confiance organisationnel.",
+  "main": "index.js",
+  "directories": {
+    "doc": "docs"
+  },
+  "type": "module",
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "bugs": {
+    "url": "https://github.com/PouletTendre/Projet_TR_STRI/issues"
+  },
+  "homepage": "https://github.com/PouletTendre/Projet_TR_STRI#readme",
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "typescript": "^7.0.2",
+    "vitest": "^5.1.0"
+  }
+}
