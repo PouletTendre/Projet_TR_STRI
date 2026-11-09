@@ -40,3 +40,5 @@ export interface ErreurApi {
   horodatage: string;
   chemin: string;
 }
+
+export * from '../chat/types.js';
