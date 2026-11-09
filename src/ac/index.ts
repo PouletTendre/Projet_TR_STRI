@@ -3,7 +3,8 @@ import {
   signCertificat,
   type RsaKeyPair,
 } from '../crypto/index.js';
-import { InMemoryJmsBroker } from '../broker/index.js';
+import { InMemoryJmsBroker, type JmsTextMessage } from '../broker/index.js';
+
 import type {
   Certificat,
   AutoriteCertificationInfo,
@@ -54,6 +55,8 @@ export class AutoriteCertification {
   public readonly keyPair: RsaKeyPair;
   public readonly certificat: Certificat;
   public readonly broker: InMemoryJmsBroker;
+  public readonly certificatsValides = new Map<string, Certificat>();
+  private compteurSerie = 1;
 
   constructor(params: {
     id: string;
@@ -71,7 +74,72 @@ export class AutoriteCertification {
     this.keyPair = params.keyPair;
     this.certificat = params.certificat;
     this.broker = params.broker;
+
+    this.certificatsValides.set(this.certificat.numeroSerie, this.certificat);
+    this.demarrerEcouteJms();
   }
+
+  public genererNumeroSerie(): string {
+    const cleanId = this.id.replace(/^AC-N\d+-/, '');
+    const num = String(this.compteurSerie++).padStart(6, '0');
+    return `SN-2026-${cleanId}-${num}`;
+  }
+
+  public demarrerEcouteJms(): void {
+    this.broker.registerQueueConsumer(
+      `queue.pki.ac.${this.id}.demandes`,
+      (message) => this.traiterDemandeQueue(message)
+    );
+  }
+
+  public traiterDemandeQueue(message: JmsTextMessage): void {
+    const correlationId =
+      (message.headers.JMSCorrelationID as string) ||
+      (message.payload as any)?.demandeId;
+    const replyTo = message.headers.JMSReplyTo as string | undefined;
+    const typeMessage = message.headers.type_message as string;
+
+    if (typeMessage === 'DEMANDE_CERTIFICATION') {
+      const payload = message.payload as any;
+      const genererBicle = !!payload.genererBicle;
+      let clePublique = payload.clePublique;
+      let clePriveeGeneree: string | null = null;
+
+      if (genererBicle) {
+        const generatedKeyPair = generateRsaKeyPair();
+        clePublique = generatedKeyPair.publicKeyBase64;
+        clePriveeGeneree = generatedKeyPair.privateKeyPem;
+        // The private key is purely ephemeral: never stored in the AC instance
+      }
+
+      const numeroSerie = this.genererNumeroSerie();
+      const cert = this.signerCertificat({
+        numeroSerie,
+        sujet: payload.sujet,
+        clePublique,
+        usage: payload.usageAutorise ?? payload.usage,
+        natureRessource: payload.natureRessource,
+      });
+
+      if (replyTo) {
+        this.broker.sendToQueue(replyTo, {
+          headers: {
+            JMSCorrelationID: correlationId,
+            type_message: 'REPONSE_CERTIFICATION',
+            statut_traitement: 'SUCCES',
+            ac_emettrice_id: this.id,
+          },
+          payload: {
+            demandeId: correlationId,
+            statut: 'SUCCES',
+            certificat: cert,
+            clePriveeGeneree,
+          },
+        });
+      }
+    }
+  }
+
 
   public getInfo(): AutoriteCertificationInfo {
     return {
@@ -114,8 +182,10 @@ export class AutoriteCertification {
     };
 
     const signedCert = signCertificat(certData, this.keyPair.privateKeyPem);
+    this.certificatsValides.set(signedCert.numeroSerie, signedCert);
     this.publierCertificat(signedCert);
     return signedCert;
+
   }
 
   public creerAcFille(options: CreerAcFilleOptions): AutoriteCertification {

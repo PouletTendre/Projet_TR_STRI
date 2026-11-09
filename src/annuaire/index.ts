@@ -5,21 +5,12 @@ import type {
   CheminCertificationReponse,
   ErreurApi,
   UsageCle,
+  RestRequest,
+  RestResponse,
 } from '../types/index.js';
 
-export interface RestRequest {
-  method: 'GET' | 'POST' | 'PUT' | 'DELETE';
-  path: string;
-  query?: Record<string, string | undefined>;
-  headers?: Record<string, string | undefined>;
-  body?: unknown;
-}
+export type { RestRequest, RestResponse };
 
-export interface RestResponse<T = unknown> {
-  status: number;
-  headers?: Record<string, string>;
-  body: T;
-}
 
 export class ServicePublication {
   private broker: InMemoryJmsBroker;

@@ -40,3 +40,60 @@ export interface ErreurApi {
   horodatage: string;
   chemin: string;
 }
+
+export type NatureRessource =
+  | 'messagerie'
+  | 'routeurs'
+  | 'services'
+  | 'utilisateurs';
+
+export interface DroitsEntiteAE {
+  nomEntite: string;
+  natureRessource: NatureRessource;
+  droitSignature: boolean;
+  droitChiffrement: boolean;
+  droitDemandeRevocation: boolean;
+  acRattachementId: string;
+}
+
+export interface EntiteAERegistre extends DroitsEntiteAE {
+  motDePasseHash: string;
+  salt: string;
+}
+
+export type StatutDemandeCertification =
+  | 'EN_ATTENTE_AC'
+  | 'EMISE'
+  | 'REJETEE';
+
+export interface DemandeCertificationRequete {
+  nomEntite: string;
+  motDePasse: string;
+  acCibleId?: string;
+  usage: UsageCle;
+  clePublique?: string;
+  genererBicle?: boolean;
+}
+
+export interface DemandeCertificationReponse {
+  demandeId: string;
+  statutDemande: StatutDemandeCertification;
+  horodatage: string;
+  certificat?: Certificat;
+  clePriveeGeneree?: string | null;
+}
+
+export interface RestRequest {
+  method: 'GET' | 'POST' | 'PUT' | 'DELETE';
+  path: string;
+  query?: Record<string, string | undefined>;
+  headers?: Record<string, string | undefined>;
+  body?: unknown;
+}
+
+export interface RestResponse<T = unknown> {
+  status: number;
+  headers?: Record<string, string>;
+  body: T;
+}
+
