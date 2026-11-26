@@ -12,7 +12,7 @@ rectangle "AC Fille Service Infrastructure (Niveau 3)\nCertifiée par AC Directi
 rectangle "AC Fille Service Utilisateurs (Niveau 3)\nCertifiée par AC Direction Métiers" as AC_N3_USR
 
 rectangle "Porteurs\n(Correspondants messagerie)" as P_MSG
-rectangle "Porteurs\n(Routeurs & équipements)" as P_INFRA
+rectangle "Porteurs\n(Routeurs & Ressources matérielles)" as P_INFRA
 rectangle "Porteurs\n(Agents & utilisateurs)" as P_USR
 
 AC_N1 --> AC_N2_DSI : Certification directe N1 -> N2

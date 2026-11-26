@@ -398,7 +398,7 @@ describe('Slice 5 — PasserelleEdgeMessagerie : cloisonnement ACL/vhost AMQP st
         typeMessage: 'INIT_ECHANGE',
         niveauSecurite: 'NON_SECURISE',
         emetteurId: 'alice',
-        destinataireId: 'bob',
+        correspondantRecepteurId: 'bob',
         horodatage: new Date().toISOString(),
         contenu: 'Salut Bob'
       },

@@ -25,6 +25,19 @@ import type {
   StatutDemandeCertification,
   UsageCle
 } from '../types/index.js';
+import {
+  buildRestError,
+  getHeaderCaseInsensitive,
+  normalizeRestPath
+} from '../utils/http.js';
+
+const DEFAULT_TTL_CLE_PRIVEE_EPHEMERES_MS = 300_000;
+
+interface ClePriveeEphemeresEntry {
+  clePrivee: string;
+  expireA: number;
+  timer: ReturnType<typeof setTimeout>;
+}
 
 interface DemandeCertificationSuivi {
   demandeId: string;
@@ -50,6 +63,7 @@ export interface AutoriteEnregistrementConfig {
   servicePublication?: ServicePublication;
   entites?: EntiteAEInscription[];
   delaiReponseAcMs?: number;
+  ttlClePriveeEphemeresMs?: number;
   acsConnues?: string[];
 }
 
@@ -59,51 +73,6 @@ export function queueAeReponses(aeId: string): string {
 
 export function routingKeyAe(aeId: string): string {
   return `ae.${aeId}`;
-}
-
-function buildError(
-  status: number,
-  code: string,
-  message: string,
-  chemin: string
-): RestResponse<ErreurApi> {
-  return {
-    status,
-    body: {
-      code,
-      message,
-      horodatage: new Date().toISOString(),
-      chemin
-    }
-  };
-}
-
-function normalizePath(rawPath: string): string {
-  const [pathOnly] = rawPath.split('?', 2);
-  let normalized = pathOnly ?? '/';
-  if (normalized.startsWith('/api/v1')) {
-    normalized = normalized.slice('/api/v1'.length) || '/';
-  }
-  if (normalized.length > 1 && normalized.endsWith('/')) {
-    normalized = normalized.slice(0, -1);
-  }
-  return normalized;
-}
-
-function getHeaderCaseInsensitive(
-  headers: Record<string, string | undefined> | undefined,
-  targetName: string
-): string | undefined {
-  if (!headers) {
-    return undefined;
-  }
-  const lowerTarget = targetName.toLowerCase();
-  for (const [key, value] of Object.entries(headers)) {
-    if (key.toLowerCase() === lowerTarget) {
-      return value;
-    }
-  }
-  return undefined;
 }
 
 function parseBasicCredentials(
@@ -172,10 +141,11 @@ export class AutoriteEnregistrement {
   private readonly entites = new Map<string, EntiteAERegistre>();
   private readonly acsConnues: Set<string> | null;
   private readonly delaiReponseAcMs: number;
+  private readonly ttlClePriveeEphemeresMs: number;
   private readonly demandes = new Map<string, DemandeCertificationSuivi>();
   private readonly attentes = new Map<string, AttenteReponseCertification>();
   private readonly attentesRevocation = new Map<string, AttenteReponseRevocation>();
-  private readonly clesPriveesEphemeres = new Map<string, string>();
+  private readonly clesPriveesEphemeres = new Map<string, ClePriveeEphemeresEntry>();
   private readonly initPromise: Promise<void>;
   private consumerTag: string | null = null;
 
@@ -187,6 +157,8 @@ export class AutoriteEnregistrement {
     this.broker = config.broker;
     this.servicePublication = config.servicePublication ?? null;
     this.delaiReponseAcMs = config.delaiReponseAcMs ?? 2000;
+    this.ttlClePriveeEphemeresMs =
+      config.ttlClePriveeEphemeresMs ?? DEFAULT_TTL_CLE_PRIVEE_EPHEMERES_MS;
     this.acsConnues = config.acsConnues ? new Set(config.acsConnues) : null;
 
     this.broker.declareExchange(AMQP_EXCHANGES.COMMANDES, 'direct', { durable: true });
@@ -224,6 +196,9 @@ export class AutoriteEnregistrement {
       clearTimeout(attente.timer);
       this.attentesRevocation.delete(demandeId);
     }
+    for (const entry of this.clesPriveesEphemeres.values()) {
+      clearTimeout(entry.timer);
+    }
     this.clesPriveesEphemeres.clear();
     if (this.consumerTag) {
       this.broker.unsubscribe(this.queueReponses, this.consumerTag);
@@ -251,7 +226,7 @@ export class AutoriteEnregistrement {
   ): RestResponse<ErreurApi> | null {
     const naturePath = decodeURIComponent(rawNature);
     if (naturePath !== this.nature) {
-      return buildError(
+      return buildRestError(
         404,
         'RESSOURCE_INTROUVABLE',
         `Cette AE traite la nature "${this.nature}", pas "${naturePath}".`,
@@ -259,7 +234,7 @@ export class AutoriteEnregistrement {
       );
     }
     if (actualMethod !== expectedMethod) {
-      return buildError(
+      return buildRestError(
         405,
         'METHODE_NON_AUTORISEE',
         `Méthode HTTP "${actualMethod}" non supportée sur cette route.`,
@@ -269,9 +244,41 @@ export class AutoriteEnregistrement {
     return null;
   }
 
+  private purgerClesPriveesExpirees(): void {
+    const now = Date.now();
+    for (const [demandeId, entry] of this.clesPriveesEphemeres.entries()) {
+      if (now >= entry.expireA) {
+        clearTimeout(entry.timer);
+        this.clesPriveesEphemeres.delete(demandeId);
+      }
+    }
+  }
+
+  private supprimerClePriveeEphemeres(demandeId: string): void {
+    const existing = this.clesPriveesEphemeres.get(demandeId);
+    if (existing) {
+      clearTimeout(existing.timer);
+      this.clesPriveesEphemeres.delete(demandeId);
+    }
+  }
+
+  private enregistrerClePriveeEphemeres(demandeId: string, clePrivee: string): void {
+    this.supprimerClePriveeEphemeres(demandeId);
+    if (this.ttlClePriveeEphemeresMs <= 0) {
+      return;
+    }
+    const expireA = Date.now() + this.ttlClePriveeEphemeresMs;
+    const timer = setTimeout(() => {
+      this.clesPriveesEphemeres.delete(demandeId);
+    }, this.ttlClePriveeEphemeresMs);
+    timer.unref?.();
+    this.clesPriveesEphemeres.set(demandeId, { clePrivee, expireA, timer });
+  }
+
   async handleRestRequest(req: RestRequest): Promise<RestResponse> {
+    this.purgerClesPriveesExpirees();
     const method = req.method.toUpperCase();
-    const normalizedPath = normalizePath(req.path);
+    const normalizedPath = normalizeRestPath(req.path);
 
     const droitsMatch = /^\/ae\/([^/]+)\/entites\/([^/]+)\/droits$/.exec(normalizedPath);
     if (droitsMatch && droitsMatch[1] && droitsMatch[2]) {
@@ -324,7 +331,7 @@ export class AutoriteEnregistrement {
       return this.soumettreDemandeRevocation(req);
     }
 
-    return buildError(
+    return buildRestError(
       404,
       'ROUTE_INTROUVABLE',
       `Ressource REST introuvable : "${req.path}".`,
@@ -338,7 +345,7 @@ export class AutoriteEnregistrement {
   ): RestResponse<DroitsEntiteAE | ErreurApi> {
     const entite = this.entites.get(nomEntite);
     if (!entite) {
-      return buildError(
+      return buildRestError(
         404,
         'ENTITE_INTROUVABLE',
         `Aucune entité "${nomEntite}" enregistrée dans l'AE "${this.aeId}".`,
@@ -347,24 +354,14 @@ export class AutoriteEnregistrement {
     }
 
     const authHeader = getHeaderCaseInsensitive(req.headers, 'Authorization');
-    const fallbackPassword = getHeaderCaseInsensitive(req.headers, 'X-Mot-De-Passe');
-
-    let authenticated = false;
-    if (authHeader !== undefined) {
-      const basic = parseBasicCredentials(authHeader);
-      if (
-        basic &&
-        basic.nomEntite === nomEntite &&
-        verifyPassword(basic.motDePasse, entite.motDePasseHash)
-      ) {
-        authenticated = true;
-      }
-    } else if (fallbackPassword !== undefined) {
-      authenticated = verifyPassword(fallbackPassword, entite.motDePasseHash);
-    }
+    const basic = parseBasicCredentials(authHeader);
+    const authenticated =
+      basic !== null &&
+      basic.nomEntite === nomEntite &&
+      verifyPassword(basic.motDePasse, entite.motDePasseHash);
 
     if (!authenticated) {
-      return buildError(
+      return buildRestError(
         401,
         'NON_AUTHENTIFIE',
         `Échec d'authentification pour l'entité "${nomEntite}".`,
@@ -403,7 +400,7 @@ export class AutoriteEnregistrement {
   ): Promise<RestResponse<DemandeCertificationReponse | ErreurApi>> {
     const body = req.body as Partial<DemandeCertificationRequete> | null | undefined;
     if (!body || typeof body !== 'object') {
-      return buildError(
+      return buildRestError(
         400,
         'REQUETE_INVALIDE',
         'Le corps de la demande de certification est requis.',
@@ -412,7 +409,7 @@ export class AutoriteEnregistrement {
     }
 
     if (typeof body.nomEntite !== 'string' || body.nomEntite.trim() === '') {
-      return buildError(
+      return buildRestError(
         400,
         'REQUETE_INVALIDE',
         'Le champ "nomEntite" doit être une chaîne non vide.',
@@ -421,7 +418,7 @@ export class AutoriteEnregistrement {
     }
 
     if (typeof body.motDePasse !== 'string' || body.motDePasse === '') {
-      return buildError(
+      return buildRestError(
         400,
         'REQUETE_INVALIDE',
         'Le champ "motDePasse" est requis.',
@@ -430,7 +427,7 @@ export class AutoriteEnregistrement {
     }
 
     if (typeof body.usage !== 'string' || !USAGES_PORTEUR_AUTORISES.has(body.usage as UsageCle)) {
-      return buildError(
+      return buildRestError(
         400,
         'REQUETE_INVALIDE',
         'Le champ "usage" doit être SIGNATURE, CHIFFREMENT ou SIGNATURE_ET_CHIFFREMENT.',
@@ -439,7 +436,7 @@ export class AutoriteEnregistrement {
     }
 
     if (body.genererBicle !== undefined && typeof body.genererBicle !== 'boolean') {
-      return buildError(
+      return buildRestError(
         400,
         'REQUETE_INVALIDE',
         'Le champ "genererBicle" doit être un booléen.',
@@ -449,7 +446,7 @@ export class AutoriteEnregistrement {
 
     const genererBicle = body.genererBicle ?? false;
     if (!genererBicle && (typeof body.clePublique !== 'string' || body.clePublique.trim() === '')) {
-      return buildError(
+      return buildRestError(
         400,
         'REQUETE_INVALIDE',
         'Le champ "clePublique" est obligatoire lorsque "genererBicle" vaut false.',
@@ -459,7 +456,7 @@ export class AutoriteEnregistrement {
 
     const entite = this.entites.get(body.nomEntite);
     if (!entite || !verifyPassword(body.motDePasse, entite.motDePasseHash)) {
-      return buildError(
+      return buildRestError(
         401,
         'NON_AUTHENTIFIE',
         `Échec d'authentification pour l'entité "${body.nomEntite}".`,
@@ -469,7 +466,7 @@ export class AutoriteEnregistrement {
 
     const usage = body.usage as UsageCle;
     if (!aDroitPourUsage(entite, usage)) {
-      return buildError(
+      return buildRestError(
         403,
         'DROITS_INSUFFISANTS',
         `L'entité "${entite.nomEntite}" ne dispose pas des droits requis pour l'usage "${usage}".`,
@@ -483,7 +480,7 @@ export class AutoriteEnregistrement {
         : entite.acRattachementId;
 
     if (!this.estAcCibleValide(acCibleId)) {
-      return buildError(
+      return buildRestError(
         404,
         'AUTORITE_INTROUVABLE',
         `AC cible de niveau 3 introuvable : "${acCibleId}".`,
@@ -556,10 +553,10 @@ export class AutoriteEnregistrement {
     }
 
     // La clé privée générée éventuelle est transmise directement et n'est jamais conservée par l'AE.
-    this.clesPriveesEphemeres.delete(demandeId);
+    this.supprimerClePriveeEphemeres(demandeId);
 
     if (reponseAc.statut === 'REJETEE' || !reponseAc.certificat) {
-      return buildError(
+      return buildRestError(
         400,
         reponseAc.erreur?.code ?? 'DEMANDE_REJETEE',
         reponseAc.erreur?.message ?? 'La demande de certification a été rejetée par l’AC.',
@@ -586,7 +583,7 @@ export class AutoriteEnregistrement {
   ): RestResponse<DemandeCertificationReponse | ErreurApi> {
     const suivi = this.demandes.get(demandeId);
     if (!suivi) {
-      return buildError(
+      return buildRestError(
         404,
         'DEMANDE_INTROUVABLE',
         `Aucune demande de certification trouvée pour l'identifiant "${demandeId}".`,
@@ -594,9 +591,11 @@ export class AutoriteEnregistrement {
       );
     }
 
-    const clePriveeOneTime = this.clesPriveesEphemeres.get(demandeId) ?? null;
-    if (clePriveeOneTime !== null) {
-      this.clesPriveesEphemeres.delete(demandeId);
+    this.purgerClesPriveesExpirees();
+    const entry = this.clesPriveesEphemeres.get(demandeId);
+    const clePriveeOneTime = entry ? entry.clePrivee : null;
+    if (entry) {
+      this.supprimerClePriveeEphemeres(demandeId);
     }
 
     return {
@@ -616,7 +615,7 @@ export class AutoriteEnregistrement {
   ): Promise<RestResponse<DemandeRevocationReponse | ErreurApi>> {
     const body = req.body as Partial<DemandeRevocationRequete> | null | undefined;
     if (!body || typeof body !== 'object') {
-      return buildError(
+      return buildRestError(
         400,
         'REQUETE_INVALIDE',
         'Le corps de la demande de révocation est requis.',
@@ -625,7 +624,7 @@ export class AutoriteEnregistrement {
     }
 
     if (typeof body.nomEntite !== 'string' || body.nomEntite.trim() === '') {
-      return buildError(
+      return buildRestError(
         400,
         'REQUETE_INVALIDE',
         'Le champ "nomEntite" doit être une chaîne non vide.',
@@ -634,7 +633,7 @@ export class AutoriteEnregistrement {
     }
 
     if (typeof body.motDePasse !== 'string' || body.motDePasse === '') {
-      return buildError(
+      return buildRestError(
         400,
         'REQUETE_INVALIDE',
         'Le champ "motDePasse" est requis.',
@@ -646,7 +645,7 @@ export class AutoriteEnregistrement {
       typeof body.numeroSerieCertificat !== 'string' ||
       body.numeroSerieCertificat.trim() === ''
     ) {
-      return buildError(
+      return buildRestError(
         400,
         'REQUETE_INVALIDE',
         'Le champ "numeroSerieCertificat" doit être une chaîne non vide.',
@@ -658,7 +657,7 @@ export class AutoriteEnregistrement {
       typeof body.action !== 'string' ||
       !ACTIONS_REVOCATION_AUTORISEES.has(body.action as ActionRevocation)
     ) {
-      return buildError(
+      return buildRestError(
         400,
         'REQUETE_INVALIDE',
         'Le champ "action" doit être REVOCATION, SUSPENSION ou REACTIVATION.',
@@ -670,7 +669,7 @@ export class AutoriteEnregistrement {
       body.motif !== undefined &&
       (typeof body.motif !== 'string' || body.motif.trim() === '')
     ) {
-      return buildError(
+      return buildRestError(
         400,
         'REQUETE_INVALIDE',
         'Le champ "motif" doit être une chaîne non vide lorsqu’il est fourni.',
@@ -680,7 +679,7 @@ export class AutoriteEnregistrement {
 
     const entite = this.entites.get(body.nomEntite);
     if (!entite || !verifyPassword(body.motDePasse, entite.motDePasseHash)) {
-      return buildError(
+      return buildRestError(
         401,
         'NON_AUTHENTIFIE',
         `Échec d'authentification pour l'entité "${body.nomEntite}".`,
@@ -689,7 +688,7 @@ export class AutoriteEnregistrement {
     }
 
     if (!entite.droitDemandeRevocation) {
-      return buildError(
+      return buildRestError(
         403,
         'DROITS_INSUFFISANTS',
         `L'entité "${entite.nomEntite}" ne dispose pas du droit de demande de révocation.`,
@@ -699,7 +698,7 @@ export class AutoriteEnregistrement {
 
     const numeroSerie = body.numeroSerieCertificat.trim();
     if (!this.servicePublication) {
-      return buildError(
+      return buildRestError(
         404,
         'CERTIFICAT_INTROUVABLE',
         `Certificat "${numeroSerie}" introuvable : aucun Service de Publication configuré.`,
@@ -712,7 +711,7 @@ export class AutoriteEnregistrement {
       path: `/annuaire/certificats/${encodeURIComponent(numeroSerie)}`
     });
     if (repCert.status !== 200) {
-      return buildError(
+      return buildRestError(
         404,
         'CERTIFICAT_INTROUVABLE',
         `Aucun certificat trouvé pour le numéro de série "${numeroSerie}".`,
@@ -722,7 +721,7 @@ export class AutoriteEnregistrement {
 
     const cert = repCert.body as Certificat;
     if (cert.sujet !== entite.nomEntite) {
-      return buildError(
+      return buildRestError(
         403,
         'DROITS_INSUFFISANTS',
         `Le certificat "${numeroSerie}" n'appartient pas au sujet "${entite.nomEntite}".`,
@@ -732,7 +731,7 @@ export class AutoriteEnregistrement {
 
     const acCibleId = cert.identifiantAcEmettrice;
     if (!this.estAcCibleValide(acCibleId)) {
-      return buildError(
+      return buildRestError(
         404,
         'AUTORITE_INTROUVABLE',
         `AC émettrice introuvable : "${acCibleId}".`,
@@ -782,7 +781,7 @@ export class AutoriteEnregistrement {
 
     const reponseAc = await reponsePromise;
     if (!reponseAc) {
-      return buildError(
+      return buildRestError(
         504,
         'DELAI_AC_DEPASSE',
         `L'AC "${acCibleId}" n'a pas répondu dans le délai imparti.`,
@@ -796,7 +795,7 @@ export class AutoriteEnregistrement {
       !reponseAc.nouvelEtatCertificat ||
       !reponseAc.horodatagePublicationLcr
     ) {
-      return buildError(
+      return buildRestError(
         reponseAc.erreur?.httpStatus ?? 409,
         reponseAc.erreur?.code ?? 'TRANSITION_INVALIDE',
         reponseAc.erreur?.message ?? 'La demande de révocation a été rejetée par l’AC.',
@@ -885,9 +884,9 @@ export class AutoriteEnregistrement {
       return;
     }
 
-    // Réponse différée (après timeout HTTP 202) : tampon éphémère à lecture unique.
+    // Réponse différée (après timeout HTTP 202) : tampon éphémère à lecture unique avec TTL.
     if (payload.statut === 'EMISE' && typeof payload.clePriveeGeneree === 'string') {
-      this.clesPriveesEphemeres.set(demandeId, payload.clePriveeGeneree);
+      this.enregistrerClePriveeEphemeres(demandeId, payload.clePriveeGeneree);
     }
   }
 }

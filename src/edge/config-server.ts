@@ -7,7 +7,7 @@ import type {
   RestRequest,
   RestResponse
 } from '../types/index.js';
-import { buildRestError, normalizeRestPath } from './http-utils.js';
+import { buildRestError, normalizeRestPath } from '../utils/http.js';
 
 export interface TopologieAcConfig {
   acRacineId: string;

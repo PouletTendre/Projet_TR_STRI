@@ -1,12 +1,15 @@
 import { randomUUID } from 'node:crypto';
 import { AMQP_EXCHANGES, InMemoryAmqpBroker } from '../amqp/index.js';
-import { chatInboxQueue, chatRoutingKey } from '../chat/transport.js';
+import {
+  chatInboxQueue,
+  chatRoutingKey,
+  convertirMessageAmqpEnEnveloppeChat,
+  normaliserProprietesChat
+} from '../chat/transport.js';
 import type {
   ChatAmqpTransport,
   ChatMessageHandler,
-  EnveloppeChatAmqp,
   MessageChatPayload,
-  ProprietesMessageChatAmqp,
   ProprietesPublicationChatAmqp,
   TypeMessageChat
 } from '../chat/types.js';
@@ -225,14 +228,6 @@ export class PasserelleEdgeMessagerie {
     return this.broker.consume<TPayload>(fileAutorisee, handler);
   }
 
-  async abonner<TPayload = unknown>(
-    correspondantId: string,
-    nomFile: string,
-    handler: AmqpConsumerHandler<TPayload>
-  ): Promise<string> {
-    return this.consommer(correspondantId, nomFile, handler);
-  }
-
   desabonner(correspondantId: string, nomFile: string, consumerTag: string): boolean {
     const id = verifierCorrespondantId(correspondantId);
     const fileAutorisee = chatInboxQueue(id);
@@ -251,26 +246,16 @@ export class PasserelleEdgeMessagerie {
 
     return {
       publierMessageChat: async (
-        destinataireId: string,
+        correspondantRecepteurId: string,
         payload: MessageChatPayload,
         proprietes: ProprietesPublicationChatAmqp
       ): Promise<void> => {
-        const propsNormalisees: ProprietesMessageChatAmqp = {
-          content_type: 'application/json',
-          delivery_mode: 2,
-          correlation_id: proprietes.correlation_id,
-          type: proprietes.type,
-          message_id: proprietes.message_id ?? randomUUID(),
-          timestamp: proprietes.timestamp ?? new Date().toISOString(),
-          headers: {
-            ...proprietes.headers
-          }
-        };
+        const propsNormalisees = normaliserProprietesChat(proprietes);
 
         await this.publier(
           id,
           AMQP_EXCHANGES.CHAT_MESSAGES,
-          chatRoutingKey(destinataireId),
+          chatRoutingKey(correspondantRecepteurId),
           payload,
           propsNormalisees
         );
@@ -285,24 +270,7 @@ export class PasserelleEdgeMessagerie {
           id,
           queueCible,
           async (msg: AmqpMessage<MessageChatPayload>) => {
-            const enveloppe: EnveloppeChatAmqp = {
-              exchange: msg.exchange,
-              routingKey: msg.routingKey,
-              payload: msg.payload,
-              rawBody: msg.rawBody,
-              properties: {
-                content_type: msg.properties.content_type as 'application/json',
-                delivery_mode: msg.properties.delivery_mode as 2,
-                correlation_id: msg.properties.correlation_id ?? '',
-                type: (msg.properties.type ??
-                  msg.payload?.typeMessage) as ProprietesMessageChatAmqp['type'],
-                message_id: msg.properties.message_id,
-                timestamp: msg.properties.timestamp,
-                headers: (msg.properties.headers ??
-                  {}) as ProprietesMessageChatAmqp['headers']
-              }
-            };
-            await handler(enveloppe);
+            await handler(convertirMessageAmqpEnEnveloppeChat(msg));
           }
         );
       },

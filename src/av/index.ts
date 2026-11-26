@@ -2,7 +2,6 @@ import { AMQP_EXCHANGES, InMemoryAmqpBroker } from '../amqp/index.js';
 import type {
   AmqpMessage,
   Certificat,
-  ErreurApi,
   ListeCertificatsRevoques,
   NatureRessource,
   PublicationCertificatPayload,
@@ -11,6 +10,7 @@ import type {
   RestResponse,
   StatutCertificatReponse
 } from '../types/index.js';
+import { buildRestError, normalizeRestPath } from '../utils/http.js';
 
 const NATURES_STD = new Set<string>([
   'messagerie',
@@ -27,36 +27,6 @@ export interface AutoriteValidationConfig {
   nature: NatureRessource;
   broker: InMemoryAmqpBroker;
   horloge?: () => Date;
-}
-
-function buildError(
-  status: number,
-  code: string,
-  message: string,
-  chemin: string,
-  horodatage: string
-): RestResponse<ErreurApi> {
-  return {
-    status,
-    body: {
-      code,
-      message,
-      horodatage,
-      chemin
-    }
-  };
-}
-
-function normalizePath(rawPath: string): string {
-  const [pathOnly] = rawPath.split('?', 2);
-  let normalized = pathOnly ?? '/';
-  if (normalized.startsWith('/api/v1')) {
-    normalized = normalized.slice('/api/v1'.length) || '/';
-  }
-  if (normalized.length > 1 && normalized.endsWith('/')) {
-    normalized = normalized.slice(0, -1);
-  }
-  return normalized;
 }
 
 function cloneCertificat(cert: Certificat): Certificat {
@@ -128,12 +98,12 @@ export class AutoriteValidation {
 
   handleRestRequest(req: RestRequest): RestResponse {
     const method = req.method.toUpperCase();
-    const normalizedPath = normalizePath(req.path);
+    const normalizedPath = normalizeRestPath(req.path);
     const nowIso = this.horloge().toISOString();
 
     const statutMatch = /^\/av\/([^/]+)\/certificats\/([^/]+)\/statut$/.exec(normalizedPath);
     if (!statutMatch || !statutMatch[1] || !statutMatch[2]) {
-      return buildError(
+      return buildRestError(
         404,
         'ROUTE_INTROUVABLE',
         `Ressource REST introuvable sur l'AV "${this.avId}" : "${req.path}".`,
@@ -146,7 +116,7 @@ export class AutoriteValidation {
     const numeroSerie = decodeURIComponent(statutMatch[2]).trim();
 
     if (!naturePath || !numeroSerie) {
-      return buildError(
+      return buildRestError(
         400,
         'REQUETE_INVALIDE',
         'La nature de ressource et le numéro de série sont obligatoires.',
@@ -157,7 +127,7 @@ export class AutoriteValidation {
 
     if (naturePath !== this.nature) {
       if (!NATURES_STD.has(naturePath)) {
-        return buildError(
+        return buildRestError(
           400,
           'NATURE_INVALIDE',
           `Nature de ressource invalide : "${naturePath}".`,
@@ -165,7 +135,7 @@ export class AutoriteValidation {
           nowIso
         );
       }
-      return buildError(
+      return buildRestError(
         404,
         'RESSOURCE_INTROUVABLE',
         `Cette AV traite la nature "${this.nature}", pas "${naturePath}".`,
@@ -175,7 +145,7 @@ export class AutoriteValidation {
     }
 
     if (method !== 'GET') {
-      return buildError(
+      return buildRestError(
         405,
         'METHODE_NON_AUTORISEE',
         `Méthode HTTP "${method}" non supportée sur cette route.`,

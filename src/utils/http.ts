@@ -1,5 +1,8 @@
 import type { ErreurApi, RestResponse } from '../types/index.js';
 
+/**
+ * Construit une réponse d'erreur REST normalisée conforme au contrat `ErreurApi`.
+ */
 export function buildRestError(
   status: number,
   code: string,
@@ -18,6 +21,10 @@ export function buildRestError(
   };
 }
 
+/**
+ * Normalise un chemin REST en supprimant la chaîne de requête, le préfixe `/api/v1`
+ * et tout slash final superflu.
+ */
 export function normalizeRestPath(rawPath: string): string {
   const [pathOnly] = rawPath.split('?', 2);
   let normalized = pathOnly ?? '/';
@@ -30,6 +37,9 @@ export function normalizeRestPath(rawPath: string): string {
   return normalized;
 }
 
+/**
+ * Recherche un en-tête HTTP de manière insensible à la casse.
+ */
 export function getHeaderCaseInsensitive(
   headers: Record<string, string | undefined> | undefined,
   targetName: string

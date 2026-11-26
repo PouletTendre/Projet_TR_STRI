@@ -197,7 +197,7 @@ rectangle "AC Fille Service Infrastructure (Niveau 3)\nCertifiée par AC Directi
 rectangle "AC Fille Service Utilisateurs (Niveau 3)\nCertifiée par AC Direction Métiers" as AC_N3_USR
 
 rectangle "Porteurs\n(Correspondants messagerie)" as P_MSG
-rectangle "Porteurs\n(Routeurs & équipements)" as P_INFRA
+rectangle "Porteurs\n(Routeurs & Ressources matérielles)" as P_INFRA
 rectangle "Porteurs\n(Agents & utilisateurs)" as P_USR
 
 AC_N1 --> AC_N2_DSI : Certification directe N1 -> N2
@@ -411,7 +411,7 @@ package "Consommateurs AMQP 0-9-1" {
   rectangle "AE (réception réponses)" as Cons_AE
   rectangle "Service de Publication" as Cons_Pub
   rectangle "AV (par nature)" as Cons_AV
-  rectangle "Correspondant destinataire" as Cons_Chat
+  rectangle "Correspondant récepteur" as Cons_Chat
 }
 
 Prod_AE --> Ex_Cmd : clé: ac.<id_ac>\n(reply_to: ae.<id_ae>, correlation_id)
@@ -461,7 +461,7 @@ Tous les messages transportés par le courtier AMQP 0-9-1 portent une charge uti
 - `correlation_id` : UUID `demandeId` sur `ex.pki.commandes`, ou `echangeId` sur `ex.chat.messages`
 - `reply_to` : clé de routage de retour `ae.<id_ae>` (obligatoire pour les commandes `DEMANDE_CERTIFICATION` et `DEMANDE_REVOCATION`)
 - `timestamp` : horodatage ISO-8601 UTC
-- `headers` : table associative applicative (`aeId`, `natureRessource`, `acId`, `niveau`, `numeroVersionLcr`, et pour le chat `echange_id`, `type_message`, `niveau_securite`, `emetteur_id`, `destinataire_id`, `numero_sequence`).
+- `headers` : table associative applicative (`aeId`, `natureRessource`, `acId`, `niveau`, `numeroVersionLcr`, et pour le chat `echange_id`, `type_message`, `niveau_securite`, `emetteur_id`, `correspondant_recepteur_id`, `numero_sequence`).
 
 ### 6.5 Spécification détaillée des 9 types de messages JSON
 
@@ -591,7 +591,7 @@ Tous les messages transportés par le courtier AMQP 0-9-1 portent une charge uti
 
 #### 7. `INIT_ECHANGE`
 - **Échangeur / Clé de routage** : `ex.chat.messages` / `inbox.<id_correspondant>` $\rightarrow$ `q.chat.inbox.<id_correspondant>`
-- **Propriétés AMQP** : `type: "INIT_ECHANGE"`, `correlation_id: "<echangeId>"`, `headers: { echange_id, type_message: "INIT_ECHANGE", niveau_securite, emetteur_id, destinataire_id, numero_sequence: 1 }`
+- **Propriétés AMQP** : `type: "INIT_ECHANGE"`, `correlation_id: "<echangeId>"`, `headers: { echange_id, type_message: "INIT_ECHANGE", niveau_securite, emetteur_id, correspondant_recepteur_id, numero_sequence: 1 }`
 - **Charge utile JSON** (`MessageChatPayload`) : ouvre l'**Échange** avec `numeroSequence: 1` et verrouille le `niveauSecurite` (`NON_SECURISE`, `SIGNE`, `CHIFFRE`, `SIGNE_ET_CHIFFRE`). Selon le mode :
   - `NON_SECURISE` : `contenu` en clair uniquement ;
   - `SIGNE` : `contenu`, `signature` (RSA-SHA256 sur le JSON canonique du message) et `numeroSerieCertificatSignature` ;
@@ -605,7 +605,7 @@ Tous les messages transportés par le courtier AMQP 0-9-1 portent une charge uti
   "typeMessage": "INIT_ECHANGE",
   "niveauSecurite": "SIGNE_ET_CHIFFRE",
   "emetteurId": "alice.martin@dsi.organisation.fr",
-  "destinataireId": "bob.dupont@dsi.organisation.fr",
+  "correspondantRecepteurId": "bob.dupont@dsi.organisation.fr",
   "horodatage": "2026-11-26T09:15:00.000Z",
   "contenuChiffre": "{\"alg\":\"RSA-OAEP+AES-256-GCM\",\"iv\":\"...\",\"tag\":\"...\",\"key\":\"...\",\"data\":\"...\"}",
   "numeroSerieCertificatChiffrement": "SN-2026-N3-DSI-MESSAGERIE-000007"
@@ -614,7 +614,7 @@ Tous les messages transportés par le courtier AMQP 0-9-1 portent une charge uti
 
 #### 8. `MSG_TEXTE`
 - **Échangeur / Clé de routage** : `ex.chat.messages` / `inbox.<id_correspondant>` $\rightarrow$ `q.chat.inbox.<id_correspondant>`
-- **Propriétés AMQP** : `type: "MSG_TEXTE"`, `correlation_id: "<echangeId>"`, `headers: { echange_id, type_message: "MSG_TEXTE", niveau_securite, emetteur_id, destinataire_id, numero_sequence }`
+- **Propriétés AMQP** : `type: "MSG_TEXTE"`, `correlation_id: "<echangeId>"`, `headers: { echange_id, type_message: "MSG_TEXTE", niveau_securite, emetteur_id, correspondant_recepteur_id, numero_sequence }`
 - **Charge utile JSON** (`MessageChatPayload`) : transporte un **Message** applicatif au sein d'un **Échange** actif avec un `numeroSequence` strictement croissant par émetteur et le même `niveauSecurite` verrouillé (exemple ci-dessous en mode `SIGNE`).
 
 ```json
@@ -624,7 +624,7 @@ Tous les messages transportés par le courtier AMQP 0-9-1 portent une charge uti
   "typeMessage": "MSG_TEXTE",
   "niveauSecurite": "SIGNE",
   "emetteurId": "bob.dupont@dsi.organisation.fr",
-  "destinataireId": "alice.martin@dsi.organisation.fr",
+  "correspondantRecepteurId": "alice.martin@dsi.organisation.fr",
   "horodatage": "2026-11-26T09:15:30.000Z",
   "contenu": "Bien reçu Alice, les paramètres sont validés.",
   "signature": "a49c0e8b12f3...",
@@ -634,7 +634,7 @@ Tous les messages transportés par le courtier AMQP 0-9-1 portent une charge uti
 
 #### 9. `FIN_MSG`
 - **Échangeur / Clé de routage** : `ex.chat.messages` / `inbox.<id_correspondant>` $\rightarrow$ `q.chat.inbox.<id_correspondant>`
-- **Propriétés AMQP** : `type: "FIN_MSG"`, `correlation_id: "<echangeId>"`, `headers: { echange_id, type_message: "FIN_MSG", niveau_securite, emetteur_id, destinataire_id, numero_sequence }`
+- **Propriétés AMQP** : `type: "FIN_MSG"`, `correlation_id: "<echangeId>"`, `headers: { echange_id, type_message: "FIN_MSG", niveau_securite, emetteur_id, correspondant_recepteur_id, numero_sequence }`
 - **Charge utile JSON** (`MessageChatPayload`) : clôture définitivement l'**Échange** ; le texte en clair transporté (en clair ou chiffré selon le `niveauSecurite` verrouillé) vaut exclusivement `"FIN_MSG"`. Tout **Message** ultérieur sur cet `echangeId` est rejeté par les deux **Correspondants**.
 
 ```json
@@ -644,7 +644,7 @@ Tous les messages transportés par le courtier AMQP 0-9-1 portent une charge uti
   "typeMessage": "FIN_MSG",
   "niveauSecurite": "SIGNE_ET_CHIFFRE",
   "emetteurId": "alice.martin@dsi.organisation.fr",
-  "destinataireId": "bob.dupont@dsi.organisation.fr",
+  "correspondantRecepteurId": "bob.dupont@dsi.organisation.fr",
   "horodatage": "2026-11-26T09:16:00.000Z",
   "contenuChiffre": "{\"alg\":\"RSA-OAEP+AES-256-GCM\",\"iv\":\"...\",\"tag\":\"...\",\"key\":\"...\",\"data\":\"...\"}",
   "numeroSerieCertificatChiffrement": "SN-2026-N3-DSI-MESSAGERIE-000007"

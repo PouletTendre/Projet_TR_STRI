@@ -75,7 +75,7 @@ function construireDonneesSignees(params: {
   typeMessage: TypeMessageChat;
   niveauSecurite: NiveauSecurite;
   emetteurId: string;
-  destinataireId: string;
+  correspondantRecepteurId: string;
   horodatage: string;
   contenu: string;
 }): string {
@@ -216,7 +216,7 @@ export class CorrespondantClient {
   }
 
   async ouvrirEchange(
-    destinataireId: string,
+    correspondantRecepteurId: string,
     niveauSecurite: NiveauSecurite,
     contenuInitial: string,
     options: OptionsOuvertureEchange = {}
@@ -228,23 +228,23 @@ export class CorrespondantClient {
         `Un Échange avec l'identifiant "${echangeId}" existe déjà.`
       );
     }
-    if (!destinataireId) {
+    if (!correspondantRecepteurId) {
       throw new ErreurMessagerie(
-        'DESTINATAIRE_INVALIDE',
-        'L’identifiant du Correspondant destinataire est obligatoire.'
+        'CORRESPONDANT_RECEPTEUR_INVALIDE',
+        'L’identifiant du Correspondant récepteur est obligatoire.'
       );
     }
 
     const certs = await this.validerCertificatsPourEchange(
-      destinataireId,
+      correspondantRecepteurId,
       niveauSecurite,
       {
         signatureNumeroSerie:
-          options.numeroSerieCertificatSignatureDestinataire ??
-          options.numeroSerieCertificatDestinataire,
+          options.numeroSerieCertificatSignatureCorrespondantRecepteur ??
+          options.numeroSerieCertificatCorrespondantRecepteur,
         chiffrementNumeroSerie:
-          options.numeroSerieCertificatChiffrementDestinataire ??
-          options.numeroSerieCertificatDestinataire
+          options.numeroSerieCertificatChiffrementCorrespondantRecepteur ??
+          options.numeroSerieCertificatCorrespondantRecepteur
       }
     );
 
@@ -255,7 +255,7 @@ export class CorrespondantClient {
 
     const session: SessionEchangeState = {
       echangeId,
-      correspondantDistantId: destinataireId,
+      correspondantDistantId: correspondantRecepteurId,
       niveauSecurite,
       statut: 'ACTIVE',
       initiateurId: this.correspondantId,
@@ -276,7 +276,7 @@ export class CorrespondantClient {
       numeroSequence,
       typeMessage,
       niveauSecurite,
-      destinataireId,
+      correspondantRecepteurId,
       horodatage,
       contenu: contenuInitial,
       certs
@@ -284,7 +284,7 @@ export class CorrespondantClient {
 
     this.sessions.set(echangeId, session);
     try {
-      await this.publierPayload(destinataireId, payload);
+      await this.publierPayload(correspondantRecepteurId, payload);
       session.dernierNumeroSequenceEnvoye = numeroSequence;
       if (sessionFermee) {
         session.statut = 'FERMEE';
@@ -301,7 +301,7 @@ export class CorrespondantClient {
       typeMessage,
       niveauSecurite,
       emetteurId: this.correspondantId,
-      destinataireId,
+      correspondantRecepteurId,
       horodatage,
       sessionFermee: session.statut === 'FERMEE'
     };
@@ -354,7 +354,7 @@ export class CorrespondantClient {
       numeroSequence,
       typeMessage,
       niveauSecurite: session.niveauSecurite,
-      destinataireId: session.correspondantDistantId,
+      correspondantRecepteurId: session.correspondantDistantId,
       horodatage,
       contenu,
       certs
@@ -373,7 +373,7 @@ export class CorrespondantClient {
       typeMessage,
       niveauSecurite: session.niveauSecurite,
       emetteurId: this.correspondantId,
-      destinataireId: session.correspondantDistantId,
+      correspondantRecepteurId: session.correspondantDistantId,
       horodatage,
       sessionFermee: session.statut === 'FERMEE'
     };
@@ -580,7 +580,7 @@ export class CorrespondantClient {
     numeroSequence: number;
     typeMessage: TypeMessageChat;
     niveauSecurite: NiveauSecurite;
-    destinataireId: string;
+    correspondantRecepteurId: string;
     horodatage: string;
     contenu: string;
     certs: CertificatsValidesEchange;
@@ -591,7 +591,7 @@ export class CorrespondantClient {
       typeMessage: params.typeMessage,
       niveauSecurite: params.niveauSecurite,
       emetteurId: this.correspondantId,
-      destinataireId: params.destinataireId,
+      correspondantRecepteurId: params.correspondantRecepteurId,
       horodatage: params.horodatage
     };
 
@@ -608,7 +608,7 @@ export class CorrespondantClient {
       typeMessage: params.typeMessage,
       niveauSecurite: params.niveauSecurite,
       emetteurId: this.correspondantId,
-      destinataireId: params.destinataireId,
+      correspondantRecepteurId: params.correspondantRecepteurId,
       horodatage: params.horodatage,
       contenu: params.contenu
     });
@@ -700,7 +700,7 @@ export class CorrespondantClient {
         typeMessage: payload.typeMessage,
         niveauSecurite: payload.niveauSecurite,
         emetteurId: payload.emetteurId,
-        destinataireId: payload.destinataireId,
+        correspondantRecepteurId: payload.correspondantRecepteurId,
         horodatage: payload.horodatage,
         contenu: payload.contenu
       });
@@ -804,7 +804,7 @@ export class CorrespondantClient {
       typeMessage: payload.typeMessage,
       niveauSecurite: payload.niveauSecurite,
       emetteurId: payload.emetteurId,
-      destinataireId: payload.destinataireId,
+      correspondantRecepteurId: payload.correspondantRecepteurId,
       horodatage: payload.horodatage,
       contenu: chargeInterne.contenu
     });
@@ -828,10 +828,10 @@ export class CorrespondantClient {
   }
 
   private async publierPayload(
-    destinataireId: string,
+    correspondantRecepteurId: string,
     payload: MessageChatPayload
   ): Promise<void> {
-    await this.transport.publierMessageChat(destinataireId, payload, {
+    await this.transport.publierMessageChat(correspondantRecepteurId, payload, {
       content_type: 'application/json',
       delivery_mode: 2,
       correlation_id: payload.echangeId,
@@ -842,7 +842,7 @@ export class CorrespondantClient {
         type_message: payload.typeMessage,
         niveau_securite: payload.niveauSecurite,
         emetteur_id: payload.emetteurId,
-        destinataire_id: payload.destinataireId,
+        correspondant_recepteur_id: payload.correspondantRecepteurId,
         numero_sequence: payload.numeroSequence
       }
     });
@@ -859,10 +859,10 @@ export class CorrespondantClient {
       );
     }
 
-    if (payload.destinataireId !== this.correspondantId) {
+    if (payload.correspondantRecepteurId !== this.correspondantId) {
       throw new ErreurSecuriteEchange(
-        'DESTINATAIRE_INCOHERENT',
-        `Message destiné à "${payload.destinataireId}" reçu par "${this.correspondantId}".`
+        'CORRESPONDANT_RECEPTEUR_INCOHERENT',
+        `Message destiné à "${payload.correspondantRecepteurId}" reçu par "${this.correspondantId}".`
       );
     }
 
@@ -949,7 +949,7 @@ export class CorrespondantClient {
         typeMessage: payload.typeMessage,
         niveauSecurite: payload.niveauSecurite,
         emetteurId: payload.emetteurId,
-        destinataireId: payload.destinataireId,
+        correspondantRecepteurId: payload.correspondantRecepteurId,
         contenu: texteClair,
         horodatage: payload.horodatage,
         sessionFermee: estCloture
@@ -1022,7 +1022,7 @@ export class CorrespondantClient {
       typeMessage: payload.typeMessage,
       niveauSecurite: existante.niveauSecurite,
       emetteurId: payload.emetteurId,
-      destinataireId: payload.destinataireId,
+      correspondantRecepteurId: payload.correspondantRecepteurId,
       contenu: texteClair,
       horodatage: payload.horodatage,
       sessionFermee: estCloture

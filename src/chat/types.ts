@@ -1,8 +1,7 @@
 import type {
   Certificat,
   NatureRessource,
-  NiveauSecurite,
-  StatutCertificat
+  NiveauSecurite
 } from '../types/index.js';
 import type { UtilisateurIcpClient } from '../client/utilisateur-icp.js';
 
@@ -17,7 +16,7 @@ export interface AmqpChatHeaders {
   type_message: TypeMessageChat;
   niveau_securite: NiveauSecurite;
   emetteur_id: string;
-  destinataire_id?: string;
+  correspondant_recepteur_id?: string;
   numero_sequence?: number;
   [key: string]: unknown;
 }
@@ -46,7 +45,7 @@ export interface MessageChatPayload {
   typeMessage: TypeMessageChat;
   niveauSecurite: NiveauSecurite;
   emetteurId: string;
-  destinataireId: string;
+  correspondantRecepteurId: string;
   horodatage: string;
   contenu?: string;
   signature?: string;
@@ -69,7 +68,7 @@ export type ChatMessageHandler = (
 
 export interface ChatAmqpTransport {
   publierMessageChat(
-    destinataireId: string,
+    correspondantRecepteurId: string,
     payload: MessageChatPayload,
     proprietes: ProprietesPublicationChatAmqp
   ): Promise<void>;
@@ -104,7 +103,7 @@ export interface MessageEnvoye {
   typeMessage: TypeMessageChat;
   niveauSecurite: NiveauSecurite;
   emetteurId: string;
-  destinataireId: string;
+  correspondantRecepteurId: string;
   horodatage: string;
   sessionFermee: boolean;
 }
@@ -115,7 +114,7 @@ export interface MessageRecu {
   typeMessage: TypeMessageChat;
   niveauSecurite: NiveauSecurite;
   emetteurId: string;
-  destinataireId: string;
+  correspondantRecepteurId: string;
   contenu: string;
   horodatage: string;
   sessionFermee: boolean;
@@ -144,16 +143,11 @@ export interface CorrespondantClientConfig {
 
 export interface OptionsOuvertureEchange {
   echangeId?: string;
-  numeroSerieCertificatDestinataire?: string;
-  numeroSerieCertificatSignatureDestinataire?: string;
-  numeroSerieCertificatChiffrementDestinataire?: string;
+  numeroSerieCertificatCorrespondantRecepteur?: string;
+  numeroSerieCertificatSignatureCorrespondantRecepteur?: string;
+  numeroSerieCertificatChiffrementCorrespondantRecepteur?: string;
 }
 
 export interface OptionsEnvoiMessage {
   niveauSecurite?: NiveauSecurite;
-}
-
-export interface ContexteValidationCertificat {
-  numeroSerieCertificat: string;
-  statutCourant?: StatutCertificat;
 }
