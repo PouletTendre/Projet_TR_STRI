@@ -1,529 +1,253 @@
-import { InMemoryJmsBroker, type JmsTextMessage } from '../broker/index.js';
-import { ServicePublication } from '../annuaire/index.js';
-import { verifyCertificatSignature } from '../crypto/index.js';
+import { AMQP_EXCHANGES, InMemoryAmqpBroker } from '../amqp/index.js';
 import type {
+  AmqpMessage,
   Certificat,
+  ListeCertificatsRevoques,
   NatureRessource,
-  StatutCertificat,
-  StatutCertificatReponse,
-  ValidationCertificatRequete,
-  ValidationCertificatReponse,
+  PublicationCertificatPayload,
   PublicationLcrPayload,
   RestRequest,
   RestResponse,
-  ErreurApi,
+  StatutCertificatReponse
 } from '../types/index.js';
+import { buildRestError, normalizeRestPath } from '../utils/http.js';
 
-interface StatutLocalEntree {
-  numeroSerie: string;
-  statut: StatutCertificat;
-  identifiantAcEmettrice?: string;
-  motifInvalidation?: string | null;
-  dateInvalidation?: string | null;
+const NATURES_STD = new Set<string>([
+  'messagerie',
+  'routeurs',
+  'services',
+  'utilisateurs'
+]);
+
+export function queueAvFlux(nature: NatureRessource): string {
+  return `q.pki.av.${nature}.flux`;
 }
 
-export interface AutoriteValidationOptions {
-  id: string;
+export interface AutoriteValidationConfig {
   nature: NatureRessource;
-  broker: InMemoryJmsBroker;
-  annuaire: ServicePublication;
+  broker: InMemoryAmqpBroker;
+  horloge?: () => Date;
 }
 
+function cloneCertificat(cert: Certificat): Certificat {
+  return { ...cert };
+}
+
+function cloneLcr(lcr: ListeCertificatsRevoques): ListeCertificatsRevoques {
+  return {
+    ...lcr,
+    entrees: lcr.entrees.map((e) => ({ ...e }))
+  };
+}
+
+/**
+ * Autorité de Validation (AV) spécialisée par nature de Ressource.
+ * Maintient en temps réel via AMQP (`q.pki.av.<nature>.flux`) l'état courant
+ * des Certificats de sa nature et de la hiérarchie d'AC, et expose uniquement
+ * `GET /av/{nature}/certificats/{numeroSerie}/statut`.
+ */
 export class AutoriteValidation {
-  public readonly id: string;
-  public readonly nature: NatureRessource;
-  public readonly broker: InMemoryJmsBroker;
-  public readonly annuaire: ServicePublication;
+  readonly nature: NatureRessource;
+  readonly avId: string;
+  readonly queueFlux: string;
 
-  private statutsCertificats = new Map<string, StatutLocalEntree>();
-  private unsubscribeCertificats: () => void;
-  private unsubscribeLcr: () => void;
+  private readonly broker: InMemoryAmqpBroker;
+  private readonly horloge: () => Date;
+  private readonly certificats = new Map<string, Certificat>();
+  private readonly lcrs = new Map<string, ListeCertificatsRevoques>();
+  private readonly initPromise: Promise<void>;
+  private consumerTag: string | null = null;
 
-  constructor(options: AutoriteValidationOptions) {
-    this.id = options.id;
-    this.nature = options.nature;
-    this.broker = options.broker;
-    this.annuaire = options.annuaire;
+  constructor(config: AutoriteValidationConfig) {
+    this.nature = config.nature;
+    this.avId = `av-${config.nature}`;
+    this.queueFlux = queueAvFlux(config.nature);
+    this.broker = config.broker;
+    this.horloge = config.horloge ?? (() => new Date());
 
-    // Real-time subscription to published certificates
-    this.unsubscribeCertificats = this.broker.subscribe<Certificat>(
-      'topic.pki.publications.certificats',
-      (msg) => this.onCertificatPublie(msg)
+    this.broker.declareExchange(AMQP_EXCHANGES.PUBLICATIONS, 'topic', { durable: true });
+    this.broker.declareQueue(this.queueFlux, { durable: true });
+    this.broker.bindQueue(
+      this.queueFlux,
+      AMQP_EXCHANGES.PUBLICATIONS,
+      `certificat.*.${this.nature}`
     );
+    this.broker.bindQueue(this.queueFlux, AMQP_EXCHANGES.PUBLICATIONS, 'certificat.*.ac');
+    this.broker.bindQueue(this.queueFlux, AMQP_EXCHANGES.PUBLICATIONS, 'lcr.#');
 
-    // Real-time subscription to LCR updates
-    this.unsubscribeLcr = this.broker.subscribe<PublicationLcrPayload>(
-      'topic.pki.publications.lcr',
-      (msg) => this.onLcrPublie(msg)
-    );
+    this.initPromise = this.broker
+      .consume(this.queueFlux, (message) => {
+        this.traiterMessagePublication(message);
+      })
+      .then((tag) => {
+        this.consumerTag = tag;
+      });
   }
 
-  public destroy(): void {
-    if (this.unsubscribeCertificats) {
-      this.unsubscribeCertificats();
-    }
-    if (this.unsubscribeLcr) {
-      this.unsubscribeLcr();
+  async ready(): Promise<void> {
+    await this.initPromise;
+  }
+
+  async arreter(): Promise<void> {
+    await this.ready();
+    if (this.consumerTag) {
+      this.broker.unsubscribe(this.queueFlux, this.consumerTag);
+      this.consumerTag = null;
     }
   }
 
-  public enregistrerCertificat(cert: Certificat): void {
-    if (!cert || !cert.numeroSerie) {
+  handleRestRequest(req: RestRequest): RestResponse {
+    const method = req.method.toUpperCase();
+    const normalizedPath = normalizeRestPath(req.path);
+    const nowIso = this.horloge().toISOString();
+
+    const statutMatch = /^\/av\/([^/]+)\/certificats\/([^/]+)\/statut$/.exec(normalizedPath);
+    if (!statutMatch || !statutMatch[1] || !statutMatch[2]) {
+      return buildRestError(
+        404,
+        'ROUTE_INTROUVABLE',
+        `Ressource REST introuvable sur l'AV "${this.avId}" : "${req.path}".`,
+        req.path,
+        nowIso
+      );
+    }
+
+    const naturePath = decodeURIComponent(statutMatch[1]).trim();
+    const numeroSerie = decodeURIComponent(statutMatch[2]).trim();
+
+    if (!naturePath || !numeroSerie) {
+      return buildRestError(
+        400,
+        'REQUETE_INVALIDE',
+        'La nature de ressource et le numéro de série sont obligatoires.',
+        req.path,
+        nowIso
+      );
+    }
+
+    if (naturePath !== this.nature) {
+      if (!NATURES_STD.has(naturePath)) {
+        return buildRestError(
+          400,
+          'NATURE_INVALIDE',
+          `Nature de ressource invalide : "${naturePath}".`,
+          req.path,
+          nowIso
+        );
+      }
+      return buildRestError(
+        404,
+        'RESSOURCE_INTROUVABLE',
+        `Cette AV traite la nature "${this.nature}", pas "${naturePath}".`,
+        req.path,
+        nowIso
+      );
+    }
+
+    if (method !== 'GET') {
+      return buildRestError(
+        405,
+        'METHODE_NON_AUTORISEE',
+        `Méthode HTTP "${method}" non supportée sur cette route.`,
+        req.path,
+        nowIso
+      );
+    }
+
+    return this.consulterStatut(numeroSerie, nowIso);
+  }
+
+  private traiterMessagePublication(message: AmqpMessage): void {
+    const type = message.properties.type;
+    const payload = message.payload as Partial<
+      PublicationCertificatPayload & PublicationLcrPayload
+    > | null;
+
+    if (!payload || typeof payload !== 'object') {
       return;
     }
-    const existing = this.statutsCertificats.get(cert.numeroSerie);
-    if (!existing || existing.statut !== 'REVOQUE') {
-      this.statutsCertificats.set(cert.numeroSerie, {
-        numeroSerie: cert.numeroSerie,
-        statut: existing?.statut ?? 'VALIDE',
-        identifiantAcEmettrice: cert.identifiantAcEmettrice,
-        motifInvalidation: existing?.motifInvalidation ?? null,
-        dateInvalidation: existing?.dateInvalidation ?? null,
-      });
-    }
-  }
 
-  public onCertificatPublie(message: JmsTextMessage<Certificat>): void {
-    this.enregistrerCertificat(message.payload);
-  }
+    if (type === 'PUBLICATION_CERTIFICAT' || payload.certificat) {
+      const cert = payload.certificat;
+      if (!cert) {
+        return;
+      }
+      const estAc =
+        cert.usage === 'CERTIFICATION_AC' ||
+        cert.natureRessource === 'autorite_certification' ||
+        payload.autoriteInfo !== undefined;
 
-  public onLcrPublie(message: JmsTextMessage<PublicationLcrPayload>): void {
-    const payload = message.payload;
-    if (payload?.evenementDeclencheur) {
-      const ev = payload.evenementDeclencheur;
-      this.mettreAJourStatut(
-        ev.numeroSerieCertificat,
-        ev.nouveauStatut,
-        ev.motif,
-        ev.dateEffet
-      );
+      if (estAc || cert.natureRessource === this.nature) {
+        this.certificats.set(cert.numeroSerie, cloneCertificat(cert));
+      }
+      return;
     }
 
-    if (payload?.entreesActives && Array.isArray(payload.entreesActives)) {
-      for (const entree of payload.entreesActives) {
-        this.mettreAJourStatut(
-          entree.numeroSerieCertificat,
-          entree.statut,
-          entree.motif,
-          entree.dateInvalidation
-        );
+    if (type === 'PUBLICATION_LCR' || payload.lcr) {
+      const lcr = payload.lcr;
+      if (
+        lcr &&
+        typeof lcr.identifiantAc === 'string' &&
+        typeof lcr.numeroVersionLcr === 'number' &&
+        Array.isArray(lcr.entrees)
+      ) {
+        const existing = this.lcrs.get(lcr.identifiantAc);
+        if (!existing || lcr.numeroVersionLcr >= existing.numeroVersionLcr) {
+          this.lcrs.set(lcr.identifiantAc, cloneLcr(lcr));
+        }
       }
     }
-
-    if (payload?.lcr?.entrees && Array.isArray(payload.lcr.entrees)) {
-      for (const entree of payload.lcr.entrees) {
-        this.mettreAJourStatut(
-          entree.numeroSerieCertificat,
-          entree.statut,
-          entree.motif,
-          entree.dateInvalidation
-        );
-      }
-    }
-
-    const headerSerie = message.headers?.numero_serie_affecte as
-      | string
-      | undefined;
-    const headerStatut = message.headers?.nouveau_statut as
-      | StatutCertificat
-      | undefined;
-    if (headerSerie && headerStatut) {
-      this.mettreAJourStatut(headerSerie, headerStatut);
-    }
   }
 
-  public mettreAJourStatut(
+  private consulterStatut(
     numeroSerie: string,
-    statut: StatutCertificat,
-    motif?: string | null,
-    dateInvalidation?: string | null
-  ): void {
-    const existing = this.statutsCertificats.get(numeroSerie);
-    const cert = this.annuaire.getCertificatParNumeroSerie(numeroSerie);
-
-    this.statutsCertificats.set(numeroSerie, {
-      numeroSerie,
-      statut,
-      identifiantAcEmettrice:
-        existing?.identifiantAcEmettrice ?? cert?.identifiantAcEmettrice,
-      motifInvalidation:
-        statut === 'VALIDE' ? null : motif ?? existing?.motifInvalidation ?? null,
-      dateInvalidation:
-        statut === 'VALIDE'
-          ? null
-          : dateInvalidation ??
-            existing?.dateInvalidation ??
-            new Date().toISOString(),
-    });
-  }
-
-  public obtenirStatut(numeroSerie: string): StatutCertificatReponse {
-    const now = new Date().toISOString();
-    let entry = this.statutsCertificats.get(numeroSerie);
-
-    if (!entry) {
-      const cert = this.annuaire.getCertificatParNumeroSerie(numeroSerie);
-      if (cert) {
-        entry = {
+    horodatageVerification: string
+  ): RestResponse<StatutCertificatReponse> {
+    const cert = this.certificats.get(numeroSerie);
+    if (!cert) {
+      return {
+        status: 200,
+        body: {
           numeroSerie,
-          statut: 'VALIDE',
-          identifiantAcEmettrice: cert.identifiantAcEmettrice,
+          statut: 'INCONNU',
+          identifiantAcEmettrice: null,
           motifInvalidation: null,
           dateInvalidation: null,
-        };
-        this.statutsCertificats.set(numeroSerie, entry);
-      }
+          horodatageVerification,
+          identifiantAv: this.avId
+        }
+      };
     }
 
-    if (!entry) {
+    const lcr = this.lcrs.get(cert.identifiantAcEmettrice);
+    const entree = lcr?.entrees.find((e) => e.numeroSerieCertificat === cert.numeroSerie);
+
+    if (entree && (entree.statut === 'REVOQUE' || entree.statut === 'SUSPENDU')) {
       return {
-        numeroSerie,
-        statut: 'INCONNU',
-        identifiantAcEmettrice: undefined,
+        status: 200,
+        body: {
+          numeroSerie: cert.numeroSerie,
+          statut: entree.statut,
+          identifiantAcEmettrice: cert.identifiantAcEmettrice,
+          motifInvalidation: entree.motif,
+          dateInvalidation: entree.dateInvalidation,
+          horodatageVerification,
+          identifiantAv: this.avId
+        }
+      };
+    }
+
+    return {
+      status: 200,
+      body: {
+        numeroSerie: cert.numeroSerie,
+        statut: 'VALIDE',
+        identifiantAcEmettrice: cert.identifiantAcEmettrice,
         motifInvalidation: null,
         dateInvalidation: null,
-        horodatageVerification: now,
-        identifiantAv: this.id,
-      };
-    }
-
-    return {
-      numeroSerie: entry.numeroSerie,
-      statut: entry.statut,
-      identifiantAcEmettrice: entry.identifiantAcEmettrice,
-      motifInvalidation: entry.motifInvalidation ?? null,
-      dateInvalidation: entry.dateInvalidation ?? null,
-      horodatageVerification: now,
-      identifiantAv: this.id,
+        horodatageVerification,
+        identifiantAv: this.avId
+      }
     };
   }
-
-  public validerCertificat(
-    requete: ValidationCertificatRequete
-  ): ValidationCertificatReponse {
-    const now = new Date();
-    const horodatageValidation = now.toISOString();
-    const cheminReponse = this.annuaire.getCheminCertification(
-      requete.numeroSerieCertificat
-    );
-
-    if (
-      !cheminReponse ||
-      !cheminReponse.chaineCertificats ||
-      cheminReponse.chaineCertificats.length === 0
-    ) {
-      const statutCourant = this.obtenirStatut(requete.numeroSerieCertificat).statut;
-      return {
-        valide: false,
-        numeroSerieCertificat: requete.numeroSerieCertificat,
-        statutCourant,
-        detailsEtapes: {
-          etape1PeriodeValiditeOk: false,
-          etape2SignatureEtCheminOk: false,
-          etape3StatutAvOk: false,
-          etape4PolitiqueUsageOk: false,
-          messageDiagnostic: `Échec de validation : certificat '${requete.numeroSerieCertificat}' introuvable dans l'Annuaire (statut ${statutCourant}).`,
-        },
-        cheminCertification: [],
-        horodatageValidation,
-      };
-    }
-
-    const chaine = cheminReponse.chaineCertificats;
-    const leafCert = chaine[0];
-    const statutCourant = this.obtenirStatut(leafCert.numeroSerie).statut;
-
-    const formattedChemin: string[] = chaine.map((c, idx) => {
-      if (idx === 0) {
-        return `${c.numeroSerie} (Sujet: ${c.sujet})`;
-      }
-      if (c.sujet === c.identifiantAcEmettrice) {
-        return `${c.numeroSerie} (${c.sujet} - Auto-signé)`;
-      }
-      return `${c.numeroSerie} (${c.sujet})`;
-    });
-
-    // Step 1: Contrôle de la période de validité
-    let etape1PeriodeValiditeOk = true;
-    for (const cert of chaine) {
-      const debut = new Date(cert.dateDebutValidite).getTime();
-      const fin = new Date(cert.dateFinValidite).getTime();
-      const tNow = now.getTime();
-      if (Number.isNaN(debut) || Number.isNaN(fin) || tNow < debut || tNow > fin) {
-        etape1PeriodeValiditeOk = false;
-        break;
-      }
-    }
-
-    // Step 2: Vérification de la signature et du chemin de certification
-    let etape2SignatureEtCheminOk = true;
-    const rootCert = chaine[chaine.length - 1];
-    if (rootCert.sujet !== rootCert.identifiantAcEmettrice) {
-      etape2SignatureEtCheminOk = false;
-    } else if (!verifyCertificatSignature(rootCert, rootCert.clePublique)) {
-      etape2SignatureEtCheminOk = false;
-    }
-
-    if (etape2SignatureEtCheminOk) {
-      for (let i = 1; i < chaine.length; i++) {
-        if (chaine[i].usage !== 'CERTIFICATION_AC') {
-          etape2SignatureEtCheminOk = false;
-          break;
-        }
-      }
-    }
-
-    if (etape2SignatureEtCheminOk) {
-      for (let i = 0; i < chaine.length - 1; i++) {
-        const child = chaine[i];
-        const parent = chaine[i + 1];
-        if (child.identifiantAcEmettrice !== parent.sujet) {
-          etape2SignatureEtCheminOk = false;
-          break;
-        }
-        if (!verifyCertificatSignature(child, parent.clePublique)) {
-          etape2SignatureEtCheminOk = false;
-          break;
-        }
-      }
-    }
-
-    // Step 3: Contrôle de l'état du certificat et des AC auprès de l'AV
-    let etape3StatutAvOk = true;
-    let etape3Cause = '';
-    for (const cert of chaine) {
-      const rep = this.obtenirStatut(cert.numeroSerie);
-      if (rep.statut !== 'VALIDE') {
-        etape3StatutAvOk = false;
-        if (cert.numeroSerie === leafCert.numeroSerie) {
-          etape3Cause = `statut non valide : ${rep.statut}`;
-        } else {
-          etape3Cause = `statut de l'AC '${cert.sujet}' non valide : ${rep.statut}`;
-        }
-        break;
-      }
-    }
-
-    // Step 4: Contrôle de la politique d'usage du certificat
-    let etape4PolitiqueUsageOk = false;
-    if (leafCert.usage === 'SIGNATURE_ET_CHIFFREMENT') {
-      etape4PolitiqueUsageOk =
-        requete.usageAttendu === 'SIGNATURE' ||
-        requete.usageAttendu === 'CHIFFREMENT' ||
-        requete.usageAttendu === 'SIGNATURE_ET_CHIFFREMENT';
-    } else if (leafCert.usage === 'SIGNATURE') {
-      etape4PolitiqueUsageOk = requete.usageAttendu === 'SIGNATURE';
-    } else if (leafCert.usage === 'CHIFFREMENT') {
-      etape4PolitiqueUsageOk = requete.usageAttendu === 'CHIFFREMENT';
-    } else if (leafCert.usage === 'CERTIFICATION_AC') {
-      etape4PolitiqueUsageOk = requete.usageAttendu === 'CERTIFICATION_AC';
-    }
-
-    if (etape4PolitiqueUsageOk && requete.sujetAttendu) {
-      if (leafCert.sujet !== requete.sujetAttendu) {
-        etape4PolitiqueUsageOk = false;
-      }
-    }
-
-    const valide =
-      etape1PeriodeValiditeOk &&
-      etape2SignatureEtCheminOk &&
-      etape3StatutAvOk &&
-      etape4PolitiqueUsageOk;
-
-    let messageDiagnostic = '';
-    if (valide) {
-      const acNames = chaine.slice(1).map((c) => c.sujet).join(' -> ');
-      messageDiagnostic = `Certificat valide : période active, Chemin de certification vérifié (${acNames}), statut VALIDE, usage ${leafCert.usage} conforme.`;
-    } else {
-      const causes: string[] = [];
-      if (!etape1PeriodeValiditeOk) {
-        causes.push('Étape 1 (période de validité expirée ou non encore active)');
-      }
-      if (!etape2SignatureEtCheminOk) {
-        causes.push(
-          'Étape 2 (signature invalide, usage intermédiaire incorrect ou rupture du chemin)'
-        );
-      }
-      if (!etape3StatutAvOk) {
-        causes.push(`Étape 3 (${etape3Cause || `statut non valide : ${statutCourant}`})`);
-      }
-      if (!etape4PolitiqueUsageOk) {
-        causes.push(
-          `Étape 4 (incompatibilité de l'usage '${leafCert.usage}' avec l'usage attendu '${requete.usageAttendu}' ou sujet divergent)`
-        );
-      }
-      messageDiagnostic = `Échec de validation : ${causes.join(' ; ')}.`;
-    }
-
-    return {
-      valide,
-      numeroSerieCertificat: leafCert.numeroSerie,
-      statutCourant,
-      detailsEtapes: {
-        etape1PeriodeValiditeOk,
-        etape2SignatureEtCheminOk,
-        etape3StatutAvOk,
-        etape4PolitiqueUsageOk,
-        messageDiagnostic,
-      },
-      cheminCertification: formattedChemin,
-      horodatageValidation,
-    };
-  }
-
-  public handleRequest(req: RestRequest): RestResponse {
-    const cleanPath = req.path.split('?')[0].replace(/\/+$/, '');
-
-    // 1. GET /av/{nature}/certificats/{numeroSerie}/statut
-    const statutMatch = cleanPath.match(
-      new RegExp(`^/av/${this.nature}/certificats/([^/]+)/statut$`)
-    );
-    if (req.method === 'GET' && statutMatch) {
-      const numeroSerie = decodeURIComponent(statutMatch[1]);
-      const statutReponse = this.obtenirStatut(numeroSerie);
-      return {
-        status: 200,
-        headers: { 'Content-Type': 'application/json' },
-        body: statutReponse,
-      };
-    }
-
-    // 2. POST /av/{nature}/validations
-    if (req.method === 'POST' && cleanPath === `/av/${this.nature}/validations`) {
-      const body = req.body as Partial<ValidationCertificatRequete> | undefined;
-      if (
-        !body ||
-        typeof body !== 'object' ||
-        !body.numeroSerieCertificat ||
-        !body.usageAttendu
-      ) {
-        const err: ErreurApi = {
-          code: 'REQUETE_INVALIDE',
-          message:
-            'Paramètres obligatoires manquants ou invalides : numeroSerieCertificat et usageAttendu sont requis.',
-          horodatage: new Date().toISOString(),
-          chemin: req.path,
-        };
-        return {
-          status: 400,
-          headers: { 'Content-Type': 'application/json' },
-          body: err,
-        };
-      }
-
-      const validationReponse = this.validerCertificat(
-        body as ValidationCertificatRequete
-      );
-      return {
-        status: 200,
-        headers: { 'Content-Type': 'application/json' },
-        body: validationReponse,
-      };
-    }
-
-    const notFound: ErreurApi = {
-      code: 'RESSOURCE_INTROUVABLE',
-      message: `Ressource introuvable : ${req.method} ${cleanPath}`,
-      horodatage: new Date().toISOString(),
-      chemin: req.path,
-    };
-    return {
-      status: 404,
-      headers: { 'Content-Type': 'application/json' },
-      body: notFound,
-    };
-  }
-}
-
-export class ServiceAutoriteValidation {
-  private instances = new Map<NatureRessource, AutoriteValidation>();
-
-  constructor(
-    public readonly broker: InMemoryJmsBroker,
-    public readonly annuaire: ServicePublication
-  ) {}
-
-  public enregistrerAv(av: AutoriteValidation): void {
-    this.instances.set(av.nature, av);
-  }
-
-  public getAvParNature(nature: NatureRessource): AutoriteValidation {
-    const av = this.instances.get(nature);
-    if (!av) {
-      throw new Error(
-        `Aucune Autorité de Validation configurée pour la nature '${nature}'.`
-      );
-    }
-    return av;
-  }
-
-  public handleRequest(req: RestRequest): RestResponse {
-    const cleanPath = req.path.split('?')[0].replace(/\/+$/, '');
-    const match = cleanPath.match(/^\/av\/([^/]+)(\/.*)?$/);
-    if (!match) {
-      const err: ErreurApi = {
-        code: 'RESSOURCE_INTROUVABLE',
-        message: `Ressource introuvable : ${req.method} ${cleanPath}`,
-        horodatage: new Date().toISOString(),
-        chemin: req.path,
-      };
-      return {
-        status: 404,
-        headers: { 'Content-Type': 'application/json' },
-        body: err,
-      };
-    }
-
-    const natureStr = match[1] as NatureRessource;
-    const av = this.instances.get(natureStr);
-    if (!av) {
-      const err: ErreurApi = {
-        code: 'NATURE_RESSOURCE_INVALIDE',
-        message: `Nature de ressource inconnue ou non gérée : '${natureStr}'.`,
-        horodatage: new Date().toISOString(),
-        chemin: req.path,
-      };
-      return {
-        status: 404,
-        headers: { 'Content-Type': 'application/json' },
-        body: err,
-      };
-    }
-
-    return av.handleRequest(req);
-  }
-}
-
-export function bootstrapAutoritesValidation(
-  broker: InMemoryJmsBroker,
-  annuaire: ServicePublication
-): ServiceAutoriteValidation {
-  const service = new ServiceAutoriteValidation(broker, annuaire);
-  const natures: NatureRessource[] = [
-    'messagerie',
-    'routeurs',
-    'services',
-    'utilisateurs',
-  ];
-
-  for (const nature of natures) {
-    const av = new AutoriteValidation({
-      id: `AV-${nature.toUpperCase()}`,
-      nature,
-      broker,
-      annuaire,
-    });
-    service.enregistrerAv(av);
-  }
-
-  // Pre-seed known certificates from Annuaire if any exist
-  const existingCerts = annuaire.rechercherCertificats();
-  for (const cert of existingCerts) {
-    for (const nature of natures) {
-      service.getAvParNature(nature).enregistrerCertificat(cert);
-    }
-  }
-
-  return service;
 }

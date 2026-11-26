@@ -1,110 +1,67 @@
-import type { RestRequest } from '../types/index.js';
-import type { RateLimitOptions } from './types.js';
-
-export interface RateLimitCheckResult {
-  allowed: boolean;
-  currentCount: number;
-  limit: number;
-  remaining: number;
-  resetMs: number;
+export interface RateLimiterConfig {
+  limiteRequetes?: number;
+  fenetreMs?: number;
+  horloge?: () => Date;
 }
 
+export interface ResultatRateLimit {
+  autorise: boolean;
+  restant: number;
+  limite: number;
+  reinitialisationMs: number;
+}
+
+/**
+ * Limiteur de débit par fenêtre glissante pour protéger les endpoints AE sensibles
+ * (`POST /ae/{nature}/demandes-certification` et `POST /ae/{nature}/demandes-revocation`).
+ */
 export class RateLimiter {
-  private windowMs: number;
-  private maxRequests: number;
-  private keyGenerator: (req: RestRequest) => string;
-  private requestsByKey = new Map<string, number[]>();
+  readonly limiteRequetes: number;
+  readonly fenetreMs: number;
 
-  constructor(options?: Partial<RateLimitOptions>) {
-    this.windowMs = options?.windowMs ?? 60_000;
-    this.maxRequests = options?.maxRequests ?? 5;
-    this.keyGenerator =
-      options?.keyGenerator ??
-      ((req: RestRequest) => {
-        const headers = req.headers ?? {};
-        let ip: string | undefined = undefined;
-        for (const [key, value] of Object.entries(headers)) {
-          const lower = key.toLowerCase();
-          if (
-            (lower === 'x-forwarded-for' ||
-              lower === 'x-real-ip' ||
-              lower === 'x-client-id') &&
-            value
-          ) {
-            ip = String(value);
-            break;
-          }
-        }
-        if (ip) return ip;
+  private readonly horloge: () => Date;
+  private readonly historiques = new Map<string, number[]>();
 
-        const body = req.body as any;
-        if (body?.nomEntite) return `entity:${body.nomEntite}`;
-
-        return 'anonymous';
-      });
+  constructor(config: RateLimiterConfig = {}) {
+    this.limiteRequetes = config.limiteRequetes ?? 30;
+    this.fenetreMs = config.fenetreMs ?? 60_000;
+    this.horloge = config.horloge ?? (() => new Date());
   }
 
-  public setOptions(options: Partial<RateLimitOptions>): void {
-    if (options.windowMs !== undefined) this.windowMs = options.windowMs;
-    if (options.maxRequests !== undefined) this.maxRequests = options.maxRequests;
-    if (options.keyGenerator !== undefined) this.keyGenerator = options.keyGenerator;
-  }
+  verifierEtConsommer(cle: string): ResultatRateLimit {
+    const maintenantMs = this.horloge().getTime();
+    const seuilMs = maintenantMs - this.fenetreMs;
 
-  public getLimit(): number {
-    return this.maxRequests;
-  }
+    const precedents = (this.historiques.get(cle) ?? []).filter((ts) => ts > seuilMs);
 
-  public getWindowMs(): number {
-    return this.windowMs;
-  }
+    if (precedents.length >= this.limiteRequetes) {
+      this.historiques.set(cle, precedents);
+      const plusAncien = precedents[0] ?? maintenantMs;
+      return {
+        autorise: false,
+        restant: 0,
+        limite: this.limiteRequetes,
+        reinitialisationMs: Math.max(0, plusAncien + this.fenetreMs - maintenantMs)
+      };
+    }
 
-  public extractKey(req: RestRequest): string {
-    return this.keyGenerator(req);
-  }
+    precedents.push(maintenantMs);
+    this.historiques.set(cle, precedents);
 
-  public check(key: string, now: number = Date.now()): RateLimitCheckResult {
-    let timestamps = this.requestsByKey.get(key) ?? [];
-    const windowStart = now - this.windowMs;
-
-    // Filter out timestamps outside the sliding window
-    timestamps = timestamps.filter((t) => t > windowStart);
-    this.requestsByKey.set(key, timestamps);
-
-    const currentCount = timestamps.length;
-    const remaining = Math.max(0, this.maxRequests - currentCount);
-    const oldestTimestamp = timestamps.length > 0 ? timestamps[0] : now;
-    const resetMs = Math.max(0, oldestTimestamp + this.windowMs - now);
-
+    const plusAncien = precedents[0] ?? maintenantMs;
     return {
-      allowed: currentCount < this.maxRequests,
-      currentCount,
-      limit: this.maxRequests,
-      remaining,
-      resetMs,
+      autorise: true,
+      restant: Math.max(0, this.limiteRequetes - precedents.length),
+      limite: this.limiteRequetes,
+      reinitialisationMs: Math.max(0, plusAncien + this.fenetreMs - maintenantMs)
     };
   }
 
-  public record(key: string, now: number = Date.now()): RateLimitCheckResult {
-    const status = this.check(key, now);
-    if (status.allowed) {
-      const timestamps = this.requestsByKey.get(key)!;
-      timestamps.push(now);
-      return {
-        allowed: true,
-        currentCount: timestamps.length,
-        limit: this.maxRequests,
-        remaining: Math.max(0, this.maxRequests - timestamps.length),
-        resetMs: status.resetMs,
-      };
+  reinitialiser(cle?: string): void {
+    if (cle === undefined) {
+      this.historiques.clear();
+      return;
     }
-    return status;
-  }
-
-  public reset(key?: string): void {
-    if (key) {
-      this.requestsByKey.delete(key);
-    } else {
-      this.requestsByKey.clear();
-    }
+    this.historiques.delete(cle);
   }
 }

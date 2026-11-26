@@ -1,691 +1,892 @@
-import crypto from 'node:crypto';
-import { InMemoryJmsBroker, type JmsTextMessage } from '../broker/index.js';
+import { randomUUID } from 'node:crypto';
+import { AMQP_EXCHANGES, InMemoryAmqpBroker } from '../amqp/index.js';
 import type { ServicePublication } from '../annuaire/index.js';
+import { hashPassword, verifyPassword } from '../crypto/index.js';
 import type {
-  NatureRessource,
-  DroitsEntiteAE,
-  EntiteAERegistre,
-  StatutDemandeCertification,
-  DemandeCertificationRequete,
-  DemandeCertificationReponse,
-  DemandeRevocationRequete,
-  DemandeRevocationReponse,
+  ActionRevocation,
+  AmqpMessage,
   Certificat,
+  CommandeDemandeCertificationPayload,
+  CommandeDemandeRevocationPayload,
+  DemandeCertificationReponse,
+  DemandeCertificationRequete,
+  DemandeRevocationReponse,
+  DemandeRevocationRequete,
+  DroitsEntiteAE,
+  EntiteAEInscription,
+  EntiteAERegistre,
+  ErreurApi,
+  MotifRevocation,
+  NatureRessource,
+  ReponseDemandeCertificationPayload,
+  ReponseDemandeRevocationPayload,
   RestRequest,
   RestResponse,
-  ErreurApi,
-  UsageCle,
+  StatutDemandeCertification,
+  UsageCle
 } from '../types/index.js';
+import {
+  buildRestError,
+  getHeaderCaseInsensitive,
+  normalizeRestPath
+} from '../utils/http.js';
 
-export interface EnregistrerEntiteOptions {
-  nomEntite: string;
-  motDePasse: string;
-  natureRessource?: NatureRessource;
-  droitSignature?: boolean;
-  droitChiffrement?: boolean;
-  droitDemandeRevocation?: boolean;
-  acRattachementId: string;
+const DEFAULT_TTL_CLE_PRIVEE_EPHEMERES_MS = 300_000;
+
+interface ClePriveeEphemeresEntry {
+  clePrivee: string;
+  expireA: number;
+  timer: ReturnType<typeof setTimeout>;
 }
 
-export function hashPassword(password: string, salt: string): string {
-  return crypto.createHash('sha256').update(`${salt}:${password}`).digest('hex');
+interface DemandeCertificationSuivi {
+  demandeId: string;
+  statutDemande: StatutDemandeCertification;
+  horodatage: string;
+  certificat?: Certificat;
+  erreur?: ErreurApi;
 }
 
-export class AutoriteEnregistrement {
-  public readonly id: string;
-  public readonly nature: NatureRessource;
-  public readonly broker: InMemoryJmsBroker;
-  public readonly annuaire?: ServicePublication;
-  private entites = new Map<string, EntiteAERegistre>();
-  private demandesParId = new Map<string, DemandeCertificationReponse>();
-  private certificatsConnus = new Map<string, Certificat>();
-  private unsubscribeCertificats: () => void;
-  private pendingReplies = new Map<
-    string,
-    {
-      resolve: (value: any) => void;
-      reject: (reason?: any) => void;
-      timer: NodeJS.Timeout;
+interface AttenteReponseCertification {
+  resolve: (reponse: ReponseDemandeCertificationPayload) => void;
+  timer: ReturnType<typeof setTimeout>;
+}
+
+interface AttenteReponseRevocation {
+  resolve: (reponse: ReponseDemandeRevocationPayload) => void;
+  timer: ReturnType<typeof setTimeout>;
+}
+
+export interface AutoriteEnregistrementConfig {
+  nature: NatureRessource;
+  broker: InMemoryAmqpBroker;
+  servicePublication?: ServicePublication;
+  entites?: EntiteAEInscription[];
+  delaiReponseAcMs?: number;
+  ttlClePriveeEphemeresMs?: number;
+  acsConnues?: string[];
+}
+
+export function queueAeReponses(aeId: string): string {
+  return `q.pki.ae.${aeId}.reponses`;
+}
+
+export function routingKeyAe(aeId: string): string {
+  return `ae.${aeId}`;
+}
+
+function parseBasicCredentials(
+  authorizationHeader: string | undefined
+): { nomEntite: string; motDePasse: string } | null {
+  if (!authorizationHeader) {
+    return null;
+  }
+  const match = /^Basic\s+(.+)$/i.exec(authorizationHeader.trim());
+  if (!match || !match[1]) {
+    return null;
+  }
+  try {
+    const decoded = Buffer.from(match[1].trim(), 'base64').toString('utf8');
+    const separatorIdx = decoded.indexOf(':');
+    if (separatorIdx < 0) {
+      return null;
     }
-  >();
-
-  constructor(options: {
-    id: string;
-    nature: NatureRessource;
-    broker: InMemoryJmsBroker;
-    annuaire?: ServicePublication;
-  }) {
-    this.id = options.id;
-    this.nature = options.nature;
-    this.broker = options.broker;
-    this.annuaire = options.annuaire;
-    this.demarrerEcouteReponses();
-
-    this.unsubscribeCertificats = this.broker.subscribe<Certificat>(
-      'topic.pki.publications.certificats',
-      (msg) => {
-        if (msg.payload?.numeroSerie) {
-          this.certificatsConnus.set(msg.payload.numeroSerie, msg.payload);
-        }
-      }
-    );
-  }
-
-  public destroy(): void {
-    if (this.unsubscribeCertificats) {
-      this.unsubscribeCertificats();
-    }
-  }
-
-  public getCertificat(numeroSerie: string): Certificat | undefined {
-    return (
-      this.certificatsConnus.get(numeroSerie) ??
-      this.annuaire?.getCertificatParNumeroSerie(numeroSerie) ??
-      undefined
-    );
-  }
-
-  private demarrerEcouteReponses(): void {
-    const queueName = `queue.pki.ae.${this.id}.reponses`;
-    this.broker.registerQueueConsumer(queueName, (message) => {
-      this.traiterMessageReponse(message);
-    });
-  }
-
-  private traiterMessageReponse(message: JmsTextMessage): void {
-    const correlationId = (message.headers.JMSCorrelationID as string) || (message.payload as any)?.demandeId;
-    if (correlationId && this.pendingReplies.has(correlationId)) {
-      const pending = this.pendingReplies.get(correlationId)!;
-      clearTimeout(pending.timer);
-      this.pendingReplies.delete(correlationId);
-      pending.resolve(message.payload);
-    }
-  }
-
-  private async traiterDemandeCertification(
-    reqBody: DemandeCertificationRequete,
-    entite: EntiteAERegistre
-  ): Promise<RestResponse> {
-    const demandeId = crypto.randomUUID();
-    const acCibleId = reqBody.acCibleId ?? entite.acRattachementId;
-
-    return new Promise<RestResponse>((resolve) => {
-      const timer = setTimeout(() => {
-        this.pendingReplies.delete(demandeId);
-        const err: ErreurApi = {
-          code: 'AC_INDISPONIBLE',
-          message: `L'AC cible '${acCibleId}' n'a pas répondu dans le délai imparti.`,
-          horodatage: new Date().toISOString(),
-          chemin: `/ae/${this.nature}/demandes-certification`,
-        };
-        resolve({
-          status: 504,
-          headers: { 'Content-Type': 'application/json' },
-          body: err,
-        });
-      }, 5000);
-
-      this.pendingReplies.set(demandeId, {
-        resolve: (payload: any) => {
-          const reponse: DemandeCertificationReponse = {
-            demandeId,
-            statutDemande: payload.statut === 'SUCCES' ? 'EMISE' : 'REJETEE',
-            horodatage: new Date().toISOString(),
-            certificat: payload.certificat,
-            clePriveeGeneree: payload.clePriveeGeneree ?? null,
-          };
-
-          // Store demand in local registry (without private key)
-          this.demandesParId.set(demandeId, {
-            demandeId,
-            statutDemande: reponse.statutDemande,
-            horodatage: reponse.horodatage,
-            certificat: reponse.certificat,
-            clePriveeGeneree: null,
-          });
-
-          resolve({
-            status: 201,
-            headers: { 'Content-Type': 'application/json' },
-            body: reponse,
-          });
-        },
-        reject: () => {},
-        timer,
-      });
-
-      // Dispatch to JMS queue queue.pki.ac.<acCibleId>.demandes
-      this.broker.sendToQueue(`queue.pki.ac.${acCibleId}.demandes`, {
-        headers: {
-          JMSCorrelationID: demandeId,
-          JMSReplyTo: `queue.pki.ae.${this.id}.reponses`,
-          type_message: 'DEMANDE_CERTIFICATION',
-          ae_emettrice_id: this.id,
-          nature_ressource: this.nature,
-          ac_cible_id: acCibleId,
-        },
-        payload: {
-          demandeId,
-          sujet: entite.nomEntite,
-          natureRessource: this.nature,
-          usageAutorise: reqBody.usage,
-          clePublique: reqBody.genererBicle ? null : reqBody.clePublique,
-          genererBicle: !!reqBody.genererBicle,
-          aeAuthentification: {
-            aeId: this.id,
-            horodatageVerification: new Date().toISOString(),
-            droitSignatureVerifie: entite.droitSignature,
-            droitChiffrementVerifie: entite.droitChiffrement,
-          },
-        },
-      });
-    });
-  }
-
-  private async traiterDemandeRevocation(
-    reqBody: DemandeRevocationRequete,
-    entite: EntiteAERegistre,
-    cert: Certificat
-  ): Promise<RestResponse> {
-    const demandeId = crypto.randomUUID();
-    const acCibleId = cert.identifiantAcEmettrice;
-
-    return new Promise<RestResponse>((resolve) => {
-      const timer = setTimeout(() => {
-        this.pendingReplies.delete(demandeId);
-        const err: ErreurApi = {
-          code: 'AC_INDISPONIBLE',
-          message: `L'AC cible '${acCibleId}' n'a pas répondu dans le délai imparti.`,
-          horodatage: new Date().toISOString(),
-          chemin: `/ae/${this.nature}/demandes-revocation`,
-        };
-        resolve({
-          status: 504,
-          headers: { 'Content-Type': 'application/json' },
-          body: err,
-        });
-      }, 5000);
-
-      this.pendingReplies.set(demandeId, {
-        resolve: (payload: any) => {
-          if (payload.statut === 'SUCCES') {
-            const reponse: DemandeRevocationReponse = {
-              demandeId,
-              numeroSerieCertificat: payload.numeroSerieCertificat,
-              identifiantAc: payload.identifiantAc,
-              actionAppliquee: payload.actionAppliquee,
-              nouvelEtatCertificat: payload.nouvelEtatCertificat,
-              horodatagePublicationLcr: payload.horodatagePublicationLcr,
-            };
-            resolve({
-              status: 200,
-              headers: { 'Content-Type': 'application/json' },
-              body: reponse,
-            });
-          } else {
-            const statusCode = payload.statusCode ?? 409;
-            const err: ErreurApi = {
-              code: payload.codeErreur ?? 'TRANSITION_INVALIDE',
-              message: payload.messageErreur ?? "Transition d'état invalide.",
-              horodatage: new Date().toISOString(),
-              chemin: `/ae/${this.nature}/demandes-revocation`,
-            };
-            resolve({
-              status: statusCode,
-              headers: { 'Content-Type': 'application/json' },
-              body: err,
-            });
-          }
-        },
-        reject: () => {},
-        timer,
-      });
-
-      // Dispatch to JMS queue queue.pki.ac.<acCibleId>.demandes
-      this.broker.sendToQueue(`queue.pki.ac.${acCibleId}.demandes`, {
-        headers: {
-          JMSCorrelationID: demandeId,
-          JMSReplyTo: `queue.pki.ae.${this.id}.reponses`,
-          type_message: 'DEMANDE_REVOCATION',
-          action_revocation: reqBody.action,
-          ae_emettrice_id: this.id,
-        },
-        payload: {
-          demandeId,
-          numeroSerieCertificat: reqBody.numeroSerieCertificat,
-          sujetDemandeur: entite.nomEntite,
-          action: reqBody.action,
-          motif: reqBody.motif,
-          aeAuthentification: {
-            aeId: this.id,
-            horodatageVerification: new Date().toISOString(),
-            droitDemandeRevocationVerifie: true,
-          },
-        },
-      });
-    });
-  }
-
-
-  public enregistrerEntite(options: EnregistrerEntiteOptions): DroitsEntiteAE {
-    const salt = crypto.randomBytes(16).toString('hex');
-    const motDePasseHash = hashPassword(options.motDePasse, salt);
-    const nature = options.natureRessource ?? this.nature;
-
-    const entite: EntiteAERegistre = {
-      nomEntite: options.nomEntite,
-      natureRessource: nature,
-      droitSignature: options.droitSignature ?? false,
-      droitChiffrement: options.droitChiffrement ?? false,
-      droitDemandeRevocation: options.droitDemandeRevocation ?? false,
-      acRattachementId: options.acRattachementId,
-      motDePasseHash,
-      salt,
-    };
-
-    this.entites.set(options.nomEntite, entite);
-    return this.toDroitsPublics(entite);
-  }
-
-  public verifierAuthentification(nomEntite: string, motDePasse: string): boolean {
-    const entite = this.entites.get(nomEntite);
-    if (!entite) {
-      return false;
-    }
-    const computedHash = hashPassword(motDePasse, entite.salt);
-    return computedHash === entite.motDePasseHash;
-  }
-
-  public getEntite(nomEntite: string): EntiteAERegistre | undefined {
-    return this.entites.get(nomEntite);
-  }
-
-  public getDroitsEntite(nomEntite: string): DroitsEntiteAE | undefined {
-    const entite = this.entites.get(nomEntite);
-    if (!entite) {
-      return undefined;
-    }
-    return this.toDroitsPublics(entite);
-  }
-
-  private toDroitsPublics(entite: EntiteAERegistre): DroitsEntiteAE {
     return {
+      nomEntite: decoded.slice(0, separatorIdx),
+      motDePasse: decoded.slice(separatorIdx + 1)
+    };
+  } catch {
+    return null;
+  }
+}
+
+const USAGES_PORTEUR_AUTORISES = new Set<UsageCle>([
+  'SIGNATURE',
+  'CHIFFREMENT',
+  'SIGNATURE_ET_CHIFFREMENT'
+]);
+
+const ACTIONS_REVOCATION_AUTORISEES = new Set<ActionRevocation>([
+  'REVOCATION',
+  'SUSPENSION',
+  'REACTIVATION'
+]);
+
+function aDroitPourUsage(entite: EntiteAERegistre, usage: UsageCle): boolean {
+  if (usage === 'SIGNATURE') {
+    return entite.droitSignature;
+  }
+  if (usage === 'CHIFFREMENT') {
+    return entite.droitChiffrement;
+  }
+  if (usage === 'SIGNATURE_ET_CHIFFREMENT') {
+    return entite.droitSignature && entite.droitChiffrement;
+  }
+  return false;
+}
+
+/**
+ * Autorité d'Enregistrement (AE) spécialisée par nature de Ressource.
+ * Authentifie les Ressources, vérifie leurs droits et relaie les demandes
+ * vers l'AC de niveau 3 via l'échangeur AMQP `ex.pki.commandes`.
+ */
+export class AutoriteEnregistrement {
+  readonly nature: NatureRessource;
+  readonly aeId: string;
+  readonly queueReponses: string;
+  readonly routingKeyReponses: string;
+
+  private readonly broker: InMemoryAmqpBroker;
+  private readonly servicePublication: ServicePublication | null;
+  private readonly entites = new Map<string, EntiteAERegistre>();
+  private readonly acsConnues: Set<string> | null;
+  private readonly delaiReponseAcMs: number;
+  private readonly ttlClePriveeEphemeresMs: number;
+  private readonly demandes = new Map<string, DemandeCertificationSuivi>();
+  private readonly attentes = new Map<string, AttenteReponseCertification>();
+  private readonly attentesRevocation = new Map<string, AttenteReponseRevocation>();
+  private readonly clesPriveesEphemeres = new Map<string, ClePriveeEphemeresEntry>();
+  private readonly initPromise: Promise<void>;
+  private consumerTag: string | null = null;
+
+  constructor(config: AutoriteEnregistrementConfig) {
+    this.nature = config.nature;
+    this.aeId = `ae-${config.nature}`;
+    this.queueReponses = queueAeReponses(this.aeId);
+    this.routingKeyReponses = routingKeyAe(this.aeId);
+    this.broker = config.broker;
+    this.servicePublication = config.servicePublication ?? null;
+    this.delaiReponseAcMs = config.delaiReponseAcMs ?? 2000;
+    this.ttlClePriveeEphemeresMs =
+      config.ttlClePriveeEphemeresMs ?? DEFAULT_TTL_CLE_PRIVEE_EPHEMERES_MS;
+    this.acsConnues = config.acsConnues ? new Set(config.acsConnues) : null;
+
+    this.broker.declareExchange(AMQP_EXCHANGES.COMMANDES, 'direct', { durable: true });
+    this.broker.declareQueue(this.queueReponses, { durable: true });
+    this.broker.bindQueue(
+      this.queueReponses,
+      AMQP_EXCHANGES.COMMANDES,
+      this.routingKeyReponses
+    );
+
+    for (const entite of config.entites ?? []) {
+      this.enregistrerEntite(entite);
+    }
+
+    this.initPromise = this.broker
+      .consume(this.queueReponses, (message) => {
+        this.traiterReponseAmqp(message);
+      })
+      .then((tag) => {
+        this.consumerTag = tag;
+      });
+  }
+
+  async ready(): Promise<void> {
+    await this.initPromise;
+  }
+
+  async arreter(): Promise<void> {
+    await this.ready();
+    for (const [demandeId, attente] of this.attentes.entries()) {
+      clearTimeout(attente.timer);
+      this.attentes.delete(demandeId);
+    }
+    for (const [demandeId, attente] of this.attentesRevocation.entries()) {
+      clearTimeout(attente.timer);
+      this.attentesRevocation.delete(demandeId);
+    }
+    for (const entry of this.clesPriveesEphemeres.values()) {
+      clearTimeout(entry.timer);
+    }
+    this.clesPriveesEphemeres.clear();
+    if (this.consumerTag) {
+      this.broker.unsubscribe(this.queueReponses, this.consumerTag);
+      this.consumerTag = null;
+    }
+  }
+
+  enregistrerEntite(entite: EntiteAEInscription): void {
+    this.entites.set(entite.nomEntite, {
       nomEntite: entite.nomEntite,
-      natureRessource: entite.natureRessource,
+      natureRessource: this.nature,
+      motDePasseHash: hashPassword(entite.motDePasse),
       droitSignature: entite.droitSignature,
       droitChiffrement: entite.droitChiffrement,
       droitDemandeRevocation: entite.droitDemandeRevocation,
-      acRattachementId: entite.acRattachementId,
-    };
-  }
-
-  public async handleRequest(req: RestRequest): Promise<RestResponse> {
-    const cleanPath = req.path.split('?')[0].replace(/\/+$/, '');
-
-    // 1. GET /ae/{nature}/entites/{nomEntite}/droits
-    const droitsMatch = cleanPath.match(
-      new RegExp(`^/ae/${this.nature}/entites/([^/]+)/droits$`)
-    );
-    if (req.method === 'GET' && droitsMatch) {
-      const nomEntite = decodeURIComponent(droitsMatch[1]);
-      const entite = this.getEntite(nomEntite);
-      if (!entite) {
-        const err: ErreurApi = {
-          code: 'ENTITE_INTROUVABLE',
-          message: `L'entité '${nomEntite}' est introuvable auprès de l'AE '${this.id}'.`,
-          horodatage: new Date().toISOString(),
-          chemin: req.path,
-        };
-        return {
-          status: 404,
-          headers: { 'Content-Type': 'application/json' },
-          body: err,
-        };
-      }
-
-      // Check authentication header X-Entite-Mot-De-Passe
-      const headerPassword =
-        req.headers?.['X-Entite-Mot-De-Passe'] ??
-        req.headers?.['x-entite-mot-de-passe'];
-
-      if (!headerPassword || !this.verifierAuthentification(nomEntite, headerPassword)) {
-        const err: ErreurApi = {
-          code: 'NON_AUTHENTIFIE',
-          message: `Authentification échouée pour l'entité '${nomEntite}'.`,
-          horodatage: new Date().toISOString(),
-          chemin: req.path,
-        };
-        return {
-          status: 401,
-          headers: { 'Content-Type': 'application/json' },
-          body: err,
-        };
-      }
-
-      return {
-        status: 200,
-        headers: { 'Content-Type': 'application/json' },
-        body: this.toDroitsPublics(entite),
-      };
-    }
-
-    // 2. POST /ae/{nature}/demandes-certification
-    if (
-      req.method === 'POST' &&
-      cleanPath === `/ae/${this.nature}/demandes-certification`
-    ) {
-      const body = req.body as Partial<DemandeCertificationRequete> | undefined;
-      if (
-        !body ||
-        typeof body !== 'object' ||
-        !body.nomEntite ||
-        !body.motDePasse ||
-        !body.usage ||
-        (!body.genererBicle && !body.clePublique)
-      ) {
-        const err: ErreurApi = {
-          code: 'REQUETE_INVALIDE',
-          message:
-            'Paramètres de demande de certification manquants ou invalides (nomEntite, motDePasse, usage ou clePublique requis).',
-          horodatage: new Date().toISOString(),
-          chemin: req.path,
-        };
-        return {
-          status: 400,
-          headers: { 'Content-Type': 'application/json' },
-          body: err,
-        };
-      }
-
-      // Authenticate entity
-      const entite = this.getEntite(body.nomEntite);
-      if (!entite || !this.verifierAuthentification(body.nomEntite, body.motDePasse)) {
-        const err: ErreurApi = {
-          code: 'NON_AUTHENTIFIE',
-          message: `Authentification échouée pour l'entité '${body.nomEntite}'.`,
-          horodatage: new Date().toISOString(),
-          chemin: req.path,
-        };
-        return {
-          status: 401,
-          headers: { 'Content-Type': 'application/json' },
-          body: err,
-        };
-      }
-
-      // Check rights against requested usage
-      if (body.usage === 'CERTIFICATION_AC') {
-        const err: ErreurApi = {
-          code: 'DROITS_INSUFFISANTS',
-          message:
-            "L'usage 'CERTIFICATION_AC' est réservé aux Autorités de Certification.",
-          horodatage: new Date().toISOString(),
-          chemin: req.path,
-        };
-        return {
-          status: 403,
-          headers: { 'Content-Type': 'application/json' },
-          body: err,
-        };
-      }
-
-      const requiresSignature =
-        body.usage === 'SIGNATURE' || body.usage === 'SIGNATURE_ET_CHIFFREMENT';
-      const requiresChiffrement =
-        body.usage === 'CHIFFREMENT' || body.usage === 'SIGNATURE_ET_CHIFFREMENT';
-
-      if (requiresSignature && !entite.droitSignature) {
-        const err: ErreurApi = {
-          code: 'DROITS_INSUFFISANTS',
-          message: `L'entité '${body.nomEntite}' ne dispose pas du droit de signature ('droitSignature=false').`,
-          horodatage: new Date().toISOString(),
-          chemin: req.path,
-        };
-        return {
-          status: 403,
-          headers: { 'Content-Type': 'application/json' },
-          body: err,
-        };
-      }
-
-      if (requiresChiffrement && !entite.droitChiffrement) {
-        const err: ErreurApi = {
-          code: 'DROITS_INSUFFISANTS',
-          message: `L'entité '${body.nomEntite}' ne dispose pas du droit de chiffrement ('droitChiffrement=false').`,
-          horodatage: new Date().toISOString(),
-          chemin: req.path,
-        };
-        return {
-          status: 403,
-          headers: { 'Content-Type': 'application/json' },
-          body: err,
-        };
-      }
-
-      return this.traiterDemandeCertification(body as DemandeCertificationRequete, entite);
-    }
-
-    // 3. GET /ae/{nature}/demandes-certification/{demandeId}
-    const demandeIdMatch = cleanPath.match(
-      new RegExp(`^/ae/${this.nature}/demandes-certification/([^/]+)$`)
-    );
-    if (req.method === 'GET' && demandeIdMatch) {
-      const demandeId = decodeURIComponent(demandeIdMatch[1]);
-      const demande = this.demandesParId.get(demandeId);
-      if (!demande) {
-        const err: ErreurApi = {
-          code: 'RESSOURCE_INTROUVABLE',
-          message: `La demande de certification '${demandeId}' est introuvable.`,
-          horodatage: new Date().toISOString(),
-          chemin: req.path,
-        };
-        return {
-          status: 404,
-          headers: { 'Content-Type': 'application/json' },
-          body: err,
-        };
-      }
-
-      return {
-        status: 200,
-        headers: { 'Content-Type': 'application/json' },
-        body: demande,
-      };
-    }
-
-    // 4. POST /ae/{nature}/demandes-revocation
-    if (
-      req.method === 'POST' &&
-      cleanPath === `/ae/${this.nature}/demandes-revocation`
-    ) {
-      const body = req.body as Partial<DemandeRevocationRequete> | undefined;
-      if (
-        !body ||
-        typeof body !== 'object' ||
-        !body.nomEntite ||
-        !body.motDePasse ||
-        !body.numeroSerieCertificat ||
-        !body.action ||
-        !['REVOCATION', 'SUSPENSION', 'REACTIVATION'].includes(body.action)
-      ) {
-        const err: ErreurApi = {
-          code: 'REQUETE_INVALIDE',
-          message:
-            'Paramètres de demande de révocation manquants ou invalides (nomEntite, motDePasse, numeroSerieCertificat, action requis).',
-          horodatage: new Date().toISOString(),
-          chemin: req.path,
-        };
-        return {
-          status: 400,
-          headers: { 'Content-Type': 'application/json' },
-          body: err,
-        };
-      }
-
-      // Authenticate entity
-      const entite = this.getEntite(body.nomEntite);
-      if (!entite || !this.verifierAuthentification(body.nomEntite, body.motDePasse)) {
-        const err: ErreurApi = {
-          code: 'NON_AUTHENTIFIE',
-          message: `Authentification échouée pour l'entité '${body.nomEntite}'.`,
-          horodatage: new Date().toISOString(),
-          chemin: req.path,
-        };
-        return {
-          status: 401,
-          headers: { 'Content-Type': 'application/json' },
-          body: err,
-        };
-      }
-
-      // Check droitDemandeRevocation
-      if (!entite.droitDemandeRevocation) {
-        const err: ErreurApi = {
-          code: 'DROITS_INSUFFISANTS',
-          message: `L'entité '${body.nomEntite}' ne dispose pas du droit de demande de révocation ('droitDemandeRevocation=false').`,
-          horodatage: new Date().toISOString(),
-          chemin: req.path,
-        };
-        return {
-          status: 403,
-          headers: { 'Content-Type': 'application/json' },
-          body: err,
-        };
-      }
-
-      // Check certificate existence
-      const cert = this.getCertificat(body.numeroSerieCertificat);
-      if (!cert) {
-        const err: ErreurApi = {
-          code: 'CERTIFICAT_INTROUVABLE',
-          message: `Le certificat avec le numéro de série '${body.numeroSerieCertificat}' est introuvable.`,
-          horodatage: new Date().toISOString(),
-          chemin: req.path,
-        };
-        return {
-          status: 404,
-          headers: { 'Content-Type': 'application/json' },
-          body: err,
-        };
-      }
-
-      // Check certificate ownership
-      if (cert.sujet !== entite.nomEntite) {
-        const err: ErreurApi = {
-          code: 'DROITS_INSUFFISANTS',
-          message: `L'entité '${body.nomEntite}' n'est pas le Porteur (Sujet) du certificat '${body.numeroSerieCertificat}'.`,
-          horodatage: new Date().toISOString(),
-          chemin: req.path,
-        };
-        return {
-          status: 403,
-          headers: { 'Content-Type': 'application/json' },
-          body: err,
-        };
-      }
-
-      // Check expiration
-      if (new Date(cert.dateFinValidite).getTime() < Date.now()) {
-        const err: ErreurApi = {
-          code: 'TRANSITION_INVALIDE',
-          message: "Impossible d'opérer sur un certificat expiré.",
-          horodatage: new Date().toISOString(),
-          chemin: req.path,
-        };
-        return {
-          status: 409,
-          headers: { 'Content-Type': 'application/json' },
-          body: err,
-        };
-      }
-
-      return this.traiterDemandeRevocation(body as DemandeRevocationRequete, entite, cert);
-    }
-
-    const notFound: ErreurApi = {
-      code: 'RESSOURCE_INTROUVABLE',
-      message: `Ressource introuvable : ${req.method} ${cleanPath}`,
-      horodatage: new Date().toISOString(),
-      chemin: req.path,
-    };
-    return {
-      status: 404,
-      headers: { 'Content-Type': 'application/json' },
-      body: notFound,
-    };
-  }
-}
-
-export class ServiceAutoriteEnregistrement {
-  private instances = new Map<NatureRessource, AutoriteEnregistrement>();
-
-  constructor(public readonly broker: InMemoryJmsBroker) {}
-
-  public enregistrerAe(ae: AutoriteEnregistrement): void {
-    this.instances.set(ae.nature, ae);
-  }
-
-  public getAeParNature(nature: NatureRessource): AutoriteEnregistrement {
-    const ae = this.instances.get(nature);
-    if (!ae) {
-      throw new Error(`Aucune Autorité d'Enregistrement configurée pour la nature '${nature}'.`);
-    }
-    return ae;
-  }
-
-  public async handleRequest(req: RestRequest): Promise<RestResponse> {
-    const cleanPath = req.path.split('?')[0].replace(/\/+$/, '');
-    const match = cleanPath.match(/^\/ae\/([^/]+)(\/.*)?$/);
-    if (!match) {
-      const err: ErreurApi = {
-        code: 'RESSOURCE_INTROUVABLE',
-        message: `Ressource introuvable : ${req.method} ${cleanPath}`,
-        horodatage: new Date().toISOString(),
-        chemin: req.path,
-      };
-      return {
-        status: 404,
-        headers: { 'Content-Type': 'application/json' },
-        body: err,
-      };
-    }
-
-    const natureStr = match[1] as NatureRessource;
-    const ae = this.instances.get(natureStr);
-    if (!ae) {
-      const err: ErreurApi = {
-        code: 'NATURE_RESSOURCE_INVALIDE',
-        message: `Nature de ressource inconnue ou non gérée : '${natureStr}'.`,
-        horodatage: new Date().toISOString(),
-        chemin: req.path,
-      };
-      return {
-        status: 404,
-        headers: { 'Content-Type': 'application/json' },
-        body: err,
-      };
-    }
-
-    return ae.handleRequest(req);
-  }
-}
-
-export function bootstrapAutoritesEnregistrement(
-  broker: InMemoryJmsBroker,
-  annuaire?: ServicePublication
-): ServiceAutoriteEnregistrement {
-  const service = new ServiceAutoriteEnregistrement(broker);
-
-  const natures: NatureRessource[] = ['messagerie', 'routeurs', 'services', 'utilisateurs'];
-  for (const nature of natures) {
-    const ae = new AutoriteEnregistrement({
-      id: `AE-${nature.toUpperCase()}`,
-      nature,
-      broker,
-      annuaire,
+      acRattachementId: entite.acRattachementId
     });
-    service.enregistrerAe(ae);
   }
 
-  return service;
+  private verifierRouteNatureEtMethode(
+    rawNature: string,
+    expectedMethod: string,
+    actualMethod: string,
+    rawPath: string
+  ): RestResponse<ErreurApi> | null {
+    const naturePath = decodeURIComponent(rawNature);
+    if (naturePath !== this.nature) {
+      return buildRestError(
+        404,
+        'RESSOURCE_INTROUVABLE',
+        `Cette AE traite la nature "${this.nature}", pas "${naturePath}".`,
+        rawPath
+      );
+    }
+    if (actualMethod !== expectedMethod) {
+      return buildRestError(
+        405,
+        'METHODE_NON_AUTORISEE',
+        `Méthode HTTP "${actualMethod}" non supportée sur cette route.`,
+        rawPath
+      );
+    }
+    return null;
+  }
+
+  private purgerClesPriveesExpirees(): void {
+    const now = Date.now();
+    for (const [demandeId, entry] of this.clesPriveesEphemeres.entries()) {
+      if (now >= entry.expireA) {
+        clearTimeout(entry.timer);
+        this.clesPriveesEphemeres.delete(demandeId);
+      }
+    }
+  }
+
+  private supprimerClePriveeEphemeres(demandeId: string): void {
+    const existing = this.clesPriveesEphemeres.get(demandeId);
+    if (existing) {
+      clearTimeout(existing.timer);
+      this.clesPriveesEphemeres.delete(demandeId);
+    }
+  }
+
+  private enregistrerClePriveeEphemeres(demandeId: string, clePrivee: string): void {
+    this.supprimerClePriveeEphemeres(demandeId);
+    if (this.ttlClePriveeEphemeresMs <= 0) {
+      return;
+    }
+    const expireA = Date.now() + this.ttlClePriveeEphemeresMs;
+    const timer = setTimeout(() => {
+      this.clesPriveesEphemeres.delete(demandeId);
+    }, this.ttlClePriveeEphemeresMs);
+    timer.unref?.();
+    this.clesPriveesEphemeres.set(demandeId, { clePrivee, expireA, timer });
+  }
+
+  async handleRestRequest(req: RestRequest): Promise<RestResponse> {
+    this.purgerClesPriveesExpirees();
+    const method = req.method.toUpperCase();
+    const normalizedPath = normalizeRestPath(req.path);
+
+    const droitsMatch = /^\/ae\/([^/]+)\/entites\/([^/]+)\/droits$/.exec(normalizedPath);
+    if (droitsMatch && droitsMatch[1] && droitsMatch[2]) {
+      const erreurRoute = this.verifierRouteNatureEtMethode(droitsMatch[1], 'GET', method, req.path);
+      if (erreurRoute) {
+        return erreurRoute;
+      }
+      return this.consulterDroitsEntite(decodeURIComponent(droitsMatch[2]), req);
+    }
+
+    const demandesMatch = /^\/ae\/([^/]+)\/demandes-certification$/.exec(normalizedPath);
+    if (demandesMatch && demandesMatch[1]) {
+      const erreurRoute = this.verifierRouteNatureEtMethode(demandesMatch[1], 'POST', method, req.path);
+      if (erreurRoute) {
+        return erreurRoute;
+      }
+      return this.soumettreDemandeCertification(req);
+    }
+
+    const demandeDetailMatch = /^\/ae\/([^/]+)\/demandes-certification\/([^/]+)$/.exec(
+      normalizedPath
+    );
+    if (demandeDetailMatch && demandeDetailMatch[1] && demandeDetailMatch[2]) {
+      const erreurRoute = this.verifierRouteNatureEtMethode(
+        demandeDetailMatch[1],
+        'GET',
+        method,
+        req.path
+      );
+      if (erreurRoute) {
+        return erreurRoute;
+      }
+      return this.consulterDemandeCertification(
+        decodeURIComponent(demandeDetailMatch[2]),
+        req.path
+      );
+    }
+
+    const revocationsMatch = /^\/ae\/([^/]+)\/demandes-revocation$/.exec(normalizedPath);
+    if (revocationsMatch && revocationsMatch[1]) {
+      const erreurRoute = this.verifierRouteNatureEtMethode(
+        revocationsMatch[1],
+        'POST',
+        method,
+        req.path
+      );
+      if (erreurRoute) {
+        return erreurRoute;
+      }
+      return this.soumettreDemandeRevocation(req);
+    }
+
+    return buildRestError(
+      404,
+      'ROUTE_INTROUVABLE',
+      `Ressource REST introuvable : "${req.path}".`,
+      req.path
+    );
+  }
+
+  private consulterDroitsEntite(
+    nomEntite: string,
+    req: RestRequest
+  ): RestResponse<DroitsEntiteAE | ErreurApi> {
+    const entite = this.entites.get(nomEntite);
+    if (!entite) {
+      return buildRestError(
+        404,
+        'ENTITE_INTROUVABLE',
+        `Aucune entité "${nomEntite}" enregistrée dans l'AE "${this.aeId}".`,
+        req.path
+      );
+    }
+
+    const authHeader = getHeaderCaseInsensitive(req.headers, 'Authorization');
+    const basic = parseBasicCredentials(authHeader);
+    const authenticated =
+      basic !== null &&
+      basic.nomEntite === nomEntite &&
+      verifyPassword(basic.motDePasse, entite.motDePasseHash);
+
+    if (!authenticated) {
+      return buildRestError(
+        401,
+        'NON_AUTHENTIFIE',
+        `Échec d'authentification pour l'entité "${nomEntite}".`,
+        req.path
+      );
+    }
+
+    return {
+      status: 200,
+      body: {
+        nomEntite: entite.nomEntite,
+        natureRessource: this.nature,
+        droitSignature: entite.droitSignature,
+        droitChiffrement: entite.droitChiffrement,
+        droitDemandeRevocation: entite.droitDemandeRevocation,
+        acRattachementId: entite.acRattachementId
+      }
+    };
+  }
+
+  private estAcCibleValide(acCibleId: string): boolean {
+    if (this.acsConnues) {
+      return this.acsConnues.has(acCibleId);
+    }
+    const targetRoutingKey = `ac.${acCibleId}`;
+    return this.broker
+      .listBindings()
+      .some(
+        (b) =>
+          b.exchange === AMQP_EXCHANGES.COMMANDES && b.routingKey === targetRoutingKey
+      );
+  }
+
+  private async soumettreDemandeCertification(
+    req: RestRequest
+  ): Promise<RestResponse<DemandeCertificationReponse | ErreurApi>> {
+    const body = req.body as Partial<DemandeCertificationRequete> | null | undefined;
+    if (!body || typeof body !== 'object') {
+      return buildRestError(
+        400,
+        'REQUETE_INVALIDE',
+        'Le corps de la demande de certification est requis.',
+        req.path
+      );
+    }
+
+    if (typeof body.nomEntite !== 'string' || body.nomEntite.trim() === '') {
+      return buildRestError(
+        400,
+        'REQUETE_INVALIDE',
+        'Le champ "nomEntite" doit être une chaîne non vide.',
+        req.path
+      );
+    }
+
+    if (typeof body.motDePasse !== 'string' || body.motDePasse === '') {
+      return buildRestError(
+        400,
+        'REQUETE_INVALIDE',
+        'Le champ "motDePasse" est requis.',
+        req.path
+      );
+    }
+
+    if (typeof body.usage !== 'string' || !USAGES_PORTEUR_AUTORISES.has(body.usage as UsageCle)) {
+      return buildRestError(
+        400,
+        'REQUETE_INVALIDE',
+        'Le champ "usage" doit être SIGNATURE, CHIFFREMENT ou SIGNATURE_ET_CHIFFREMENT.',
+        req.path
+      );
+    }
+
+    if (body.genererBicle !== undefined && typeof body.genererBicle !== 'boolean') {
+      return buildRestError(
+        400,
+        'REQUETE_INVALIDE',
+        'Le champ "genererBicle" doit être un booléen.',
+        req.path
+      );
+    }
+
+    const genererBicle = body.genererBicle ?? false;
+    if (!genererBicle && (typeof body.clePublique !== 'string' || body.clePublique.trim() === '')) {
+      return buildRestError(
+        400,
+        'REQUETE_INVALIDE',
+        'Le champ "clePublique" est obligatoire lorsque "genererBicle" vaut false.',
+        req.path
+      );
+    }
+
+    const entite = this.entites.get(body.nomEntite);
+    if (!entite || !verifyPassword(body.motDePasse, entite.motDePasseHash)) {
+      return buildRestError(
+        401,
+        'NON_AUTHENTIFIE',
+        `Échec d'authentification pour l'entité "${body.nomEntite}".`,
+        req.path
+      );
+    }
+
+    const usage = body.usage as UsageCle;
+    if (!aDroitPourUsage(entite, usage)) {
+      return buildRestError(
+        403,
+        'DROITS_INSUFFISANTS',
+        `L'entité "${entite.nomEntite}" ne dispose pas des droits requis pour l'usage "${usage}".`,
+        req.path
+      );
+    }
+
+    const acCibleId =
+      typeof body.acCibleId === 'string' && body.acCibleId.trim() !== ''
+        ? body.acCibleId.trim()
+        : entite.acRattachementId;
+
+    if (!this.estAcCibleValide(acCibleId)) {
+      return buildRestError(
+        404,
+        'AUTORITE_INTROUVABLE',
+        `AC cible de niveau 3 introuvable : "${acCibleId}".`,
+        req.path
+      );
+    }
+
+    const demandeId = randomUUID();
+    const horodatage = new Date().toISOString();
+    this.demandes.set(demandeId, {
+      demandeId,
+      statutDemande: 'EN_ATTENTE_AC',
+      horodatage
+    });
+
+    await this.ready();
+
+    const reponsePromise = new Promise<ReponseDemandeCertificationPayload | null>((resolve) => {
+      const timer = setTimeout(() => {
+        this.attentes.delete(demandeId);
+        resolve(null);
+      }, this.delaiReponseAcMs);
+      this.attentes.set(demandeId, {
+        resolve: (payload) => resolve(payload),
+        timer
+      });
+    });
+
+    const commandePayload: CommandeDemandeCertificationPayload = {
+      demandeId,
+      sujet: entite.nomEntite,
+      natureRessource: this.nature,
+      acCibleId,
+      usage,
+      ...(typeof body.clePublique === 'string' && body.clePublique.trim() !== ''
+        ? { clePublique: body.clePublique }
+        : {}),
+      genererBicle
+    };
+
+    await this.broker.publish(
+      AMQP_EXCHANGES.COMMANDES,
+      `ac.${acCibleId}`,
+      commandePayload,
+      {
+        type: 'DEMANDE_CERTIFICATION',
+        correlation_id: demandeId,
+        reply_to: this.routingKeyReponses,
+        headers: {
+          aeId: this.aeId,
+          natureRessource: this.nature
+        }
+      }
+    );
+
+    const reponseAc = await reponsePromise;
+    if (!reponseAc) {
+      return {
+        status: 202,
+        headers: {
+          Location: `/api/v1/ae/${this.nature}/demandes-certification/${demandeId}`
+        },
+        body: {
+          demandeId,
+          statutDemande: 'EN_ATTENTE_AC',
+          horodatage,
+          clePriveeGeneree: null
+        }
+      };
+    }
+
+    // La clé privée générée éventuelle est transmise directement et n'est jamais conservée par l'AE.
+    this.supprimerClePriveeEphemeres(demandeId);
+
+    if (reponseAc.statut === 'REJETEE' || !reponseAc.certificat) {
+      return buildRestError(
+        400,
+        reponseAc.erreur?.code ?? 'DEMANDE_REJETEE',
+        reponseAc.erreur?.message ?? 'La demande de certification a été rejetée par l’AC.',
+        req.path
+      );
+    }
+
+    const suivi = this.demandes.get(demandeId);
+    return {
+      status: 201,
+      body: {
+        demandeId,
+        statutDemande: 'EMISE',
+        horodatage: suivi?.horodatage ?? new Date().toISOString(),
+        certificat: { ...reponseAc.certificat },
+        clePriveeGeneree: reponseAc.clePriveeGeneree ?? null
+      }
+    };
+  }
+
+  private consulterDemandeCertification(
+    demandeId: string,
+    chemin: string
+  ): RestResponse<DemandeCertificationReponse | ErreurApi> {
+    const suivi = this.demandes.get(demandeId);
+    if (!suivi) {
+      return buildRestError(
+        404,
+        'DEMANDE_INTROUVABLE',
+        `Aucune demande de certification trouvée pour l'identifiant "${demandeId}".`,
+        chemin
+      );
+    }
+
+    this.purgerClesPriveesExpirees();
+    const entry = this.clesPriveesEphemeres.get(demandeId);
+    const clePriveeOneTime = entry ? entry.clePrivee : null;
+    if (entry) {
+      this.supprimerClePriveeEphemeres(demandeId);
+    }
+
+    return {
+      status: 200,
+      body: {
+        demandeId: suivi.demandeId,
+        statutDemande: suivi.statutDemande,
+        horodatage: suivi.horodatage,
+        ...(suivi.certificat ? { certificat: { ...suivi.certificat } } : {}),
+        clePriveeGeneree: clePriveeOneTime
+      }
+    };
+  }
+
+  private async soumettreDemandeRevocation(
+    req: RestRequest
+  ): Promise<RestResponse<DemandeRevocationReponse | ErreurApi>> {
+    const body = req.body as Partial<DemandeRevocationRequete> | null | undefined;
+    if (!body || typeof body !== 'object') {
+      return buildRestError(
+        400,
+        'REQUETE_INVALIDE',
+        'Le corps de la demande de révocation est requis.',
+        req.path
+      );
+    }
+
+    if (typeof body.nomEntite !== 'string' || body.nomEntite.trim() === '') {
+      return buildRestError(
+        400,
+        'REQUETE_INVALIDE',
+        'Le champ "nomEntite" doit être une chaîne non vide.',
+        req.path
+      );
+    }
+
+    if (typeof body.motDePasse !== 'string' || body.motDePasse === '') {
+      return buildRestError(
+        400,
+        'REQUETE_INVALIDE',
+        'Le champ "motDePasse" est requis.',
+        req.path
+      );
+    }
+
+    if (
+      typeof body.numeroSerieCertificat !== 'string' ||
+      body.numeroSerieCertificat.trim() === ''
+    ) {
+      return buildRestError(
+        400,
+        'REQUETE_INVALIDE',
+        'Le champ "numeroSerieCertificat" doit être une chaîne non vide.',
+        req.path
+      );
+    }
+
+    if (
+      typeof body.action !== 'string' ||
+      !ACTIONS_REVOCATION_AUTORISEES.has(body.action as ActionRevocation)
+    ) {
+      return buildRestError(
+        400,
+        'REQUETE_INVALIDE',
+        'Le champ "action" doit être REVOCATION, SUSPENSION ou REACTIVATION.',
+        req.path
+      );
+    }
+
+    if (
+      body.motif !== undefined &&
+      (typeof body.motif !== 'string' || body.motif.trim() === '')
+    ) {
+      return buildRestError(
+        400,
+        'REQUETE_INVALIDE',
+        'Le champ "motif" doit être une chaîne non vide lorsqu’il est fourni.',
+        req.path
+      );
+    }
+
+    const entite = this.entites.get(body.nomEntite);
+    if (!entite || !verifyPassword(body.motDePasse, entite.motDePasseHash)) {
+      return buildRestError(
+        401,
+        'NON_AUTHENTIFIE',
+        `Échec d'authentification pour l'entité "${body.nomEntite}".`,
+        req.path
+      );
+    }
+
+    if (!entite.droitDemandeRevocation) {
+      return buildRestError(
+        403,
+        'DROITS_INSUFFISANTS',
+        `L'entité "${entite.nomEntite}" ne dispose pas du droit de demande de révocation.`,
+        req.path
+      );
+    }
+
+    const numeroSerie = body.numeroSerieCertificat.trim();
+    if (!this.servicePublication) {
+      return buildRestError(
+        404,
+        'CERTIFICAT_INTROUVABLE',
+        `Certificat "${numeroSerie}" introuvable : aucun Service de Publication configuré.`,
+        req.path
+      );
+    }
+
+    const repCert = this.servicePublication.handleRestRequest({
+      method: 'GET',
+      path: `/annuaire/certificats/${encodeURIComponent(numeroSerie)}`
+    });
+    if (repCert.status !== 200) {
+      return buildRestError(
+        404,
+        'CERTIFICAT_INTROUVABLE',
+        `Aucun certificat trouvé pour le numéro de série "${numeroSerie}".`,
+        req.path
+      );
+    }
+
+    const cert = repCert.body as Certificat;
+    if (cert.sujet !== entite.nomEntite) {
+      return buildRestError(
+        403,
+        'DROITS_INSUFFISANTS',
+        `Le certificat "${numeroSerie}" n'appartient pas au sujet "${entite.nomEntite}".`,
+        req.path
+      );
+    }
+
+    const acCibleId = cert.identifiantAcEmettrice;
+    if (!this.estAcCibleValide(acCibleId)) {
+      return buildRestError(
+        404,
+        'AUTORITE_INTROUVABLE',
+        `AC émettrice introuvable : "${acCibleId}".`,
+        req.path
+      );
+    }
+
+    const demandeId = randomUUID();
+    await this.ready();
+
+    const reponsePromise = new Promise<ReponseDemandeRevocationPayload | null>((resolve) => {
+      const timer = setTimeout(() => {
+        this.attentesRevocation.delete(demandeId);
+        resolve(null);
+      }, this.delaiReponseAcMs);
+      this.attentesRevocation.set(demandeId, {
+        resolve: (payload) => resolve(payload),
+        timer
+      });
+    });
+
+    const commandePayload: CommandeDemandeRevocationPayload = {
+      demandeId,
+      sujet: entite.nomEntite,
+      numeroSerieCertificat: numeroSerie,
+      acCibleId,
+      action: body.action as ActionRevocation,
+      ...(typeof body.motif === 'string' && body.motif.trim() !== ''
+        ? { motif: body.motif.trim() as MotifRevocation }
+        : {})
+    };
+
+    await this.broker.publish(
+      AMQP_EXCHANGES.COMMANDES,
+      `ac.${acCibleId}`,
+      commandePayload,
+      {
+        type: 'DEMANDE_REVOCATION',
+        correlation_id: demandeId,
+        reply_to: this.routingKeyReponses,
+        headers: {
+          aeId: this.aeId,
+          natureRessource: this.nature
+        }
+      }
+    );
+
+    const reponseAc = await reponsePromise;
+    if (!reponseAc) {
+      return buildRestError(
+        504,
+        'DELAI_AC_DEPASSE',
+        `L'AC "${acCibleId}" n'a pas répondu dans le délai imparti.`,
+        req.path
+      );
+    }
+
+    if (
+      reponseAc.statut === 'REJETEE' ||
+      !reponseAc.actionAppliquee ||
+      !reponseAc.nouvelEtatCertificat ||
+      !reponseAc.horodatagePublicationLcr
+    ) {
+      return buildRestError(
+        reponseAc.erreur?.httpStatus ?? 409,
+        reponseAc.erreur?.code ?? 'TRANSITION_INVALIDE',
+        reponseAc.erreur?.message ?? 'La demande de révocation a été rejetée par l’AC.',
+        req.path
+      );
+    }
+
+    return {
+      status: 200,
+      body: {
+        demandeId,
+        numeroSerieCertificat: reponseAc.numeroSerieCertificat,
+        identifiantAc: reponseAc.identifiantAc,
+        actionAppliquee: reponseAc.actionAppliquee,
+        nouvelEtatCertificat: reponseAc.nouvelEtatCertificat,
+        horodatagePublicationLcr: reponseAc.horodatagePublicationLcr
+      }
+    };
+  }
+
+  private traiterReponseAmqp(message: AmqpMessage): void {
+    if (message.properties.type === 'REPONSE_REVOCATION') {
+      const payload = message.payload as Partial<ReponseDemandeRevocationPayload> | null;
+      const demandeId = message.properties.correlation_id ?? payload?.demandeId;
+      if (!demandeId || !payload) {
+        return;
+      }
+      const attenteRev = this.attentesRevocation.get(demandeId);
+      if (attenteRev) {
+        clearTimeout(attenteRev.timer);
+        this.attentesRevocation.delete(demandeId);
+        attenteRev.resolve({
+          demandeId,
+          numeroSerieCertificat: payload.numeroSerieCertificat ?? '',
+          identifiantAc: payload.identifiantAc ?? '',
+          statut: payload.statut === 'APPLIQUEE' ? 'APPLIQUEE' : 'REJETEE',
+          ...(payload.actionAppliquee ? { actionAppliquee: payload.actionAppliquee } : {}),
+          ...(payload.nouvelEtatCertificat
+            ? { nouvelEtatCertificat: payload.nouvelEtatCertificat }
+            : {}),
+          ...(payload.horodatagePublicationLcr
+            ? { horodatagePublicationLcr: payload.horodatagePublicationLcr }
+            : {}),
+          ...(payload.erreur ? { erreur: payload.erreur } : {})
+        });
+      }
+      return;
+    }
+
+    if (message.properties.type !== 'REPONSE_CERTIFICATION') {
+      return;
+    }
+
+    const payload = message.payload as Partial<ReponseDemandeCertificationPayload> | null;
+    const demandeId = message.properties.correlation_id ?? payload?.demandeId;
+    if (!demandeId || !payload) {
+      return;
+    }
+
+    const suivi = this.demandes.get(demandeId);
+    if (!suivi) {
+      return;
+    }
+
+    const nowIso = new Date().toISOString();
+    suivi.horodatage = nowIso;
+
+    if (payload.statut === 'EMISE' && payload.certificat) {
+      suivi.statutDemande = 'EMISE';
+      suivi.certificat = { ...payload.certificat };
+    } else {
+      suivi.statutDemande = 'REJETEE';
+    }
+
+    const attente = this.attentes.get(demandeId);
+    if (attente) {
+      clearTimeout(attente.timer);
+      this.attentes.delete(demandeId);
+      attente.resolve({
+        demandeId,
+        statut: payload.statut === 'EMISE' ? 'EMISE' : 'REJETEE',
+        ...(payload.certificat ? { certificat: { ...payload.certificat } } : {}),
+        clePriveeGeneree: payload.clePriveeGeneree ?? null,
+        ...(payload.erreur ? { erreur: payload.erreur } : {})
+      });
+      return;
+    }
+
+    // Réponse différée (après timeout HTTP 202) : tampon éphémère à lecture unique avec TTL.
+    if (payload.statut === 'EMISE' && typeof payload.clePriveeGeneree === 'string') {
+      this.enregistrerClePriveeEphemeres(demandeId, payload.clePriveeGeneree);
+    }
+  }
 }

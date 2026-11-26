@@ -1,546 +1,762 @@
-import crypto from 'node:crypto';
+import { AMQP_EXCHANGES, InMemoryAmqpBroker } from '../amqp/index.js';
 import {
   generateRsaKeyPair,
+  publicKeyPemToBase64,
   signCertificat,
   signLcr,
-  type RsaKeyPair,
+  type RsaKeyPair
 } from '../crypto/index.js';
-import { InMemoryJmsBroker, type JmsTextMessage } from '../broker/index.js';
-
 import type {
-  Certificat,
-  AutoriteCertificationInfo,
-  UsageCle,
   ActionRevocation,
-  StatutCertificat,
+  AmqpMessage,
+  AutoriteCertificationInfo,
+  Certificat,
+  CommandeDemandeCertificationPayload,
+  CommandeDemandeRevocationPayload,
   EntreeLcr,
   ListeCertificatsRevoques,
-  DemandeRevocationReponse,
+  MotifRevocation,
+  PublicationCertificatPayload,
+  PublicationLcrPayload,
+  ReponseDemandeCertificationPayload,
+  ReponseDemandeRevocationPayload,
+  StatutCertificat
 } from '../types/index.js';
 
-export interface CreateRootOptions {
-  id: string;
+export interface OptionsValiditeAc {
+  dateDebut?: Date;
+  dureeValiditeJours?: number;
+  horloge?: () => Date;
+}
+
+export interface ResultatInvalidationSucces {
+  succes: true;
+  numeroSerieCertificat: string;
+  identifiantAc: string;
+  actionAppliquee: ActionRevocation;
+  nouvelEtatCertificat: StatutCertificat;
+  horodatagePublicationLcr: string;
+  lcr: ListeCertificatsRevoques;
+}
+
+export interface ResultatInvalidationRejet {
+  succes: false;
+  httpStatus: 404 | 409;
+  code: 'CERTIFICAT_INTROUVABLE' | 'CERTIFICAT_EXPIRE' | 'TRANSITION_INVALIDE';
+  message: string;
+}
+
+export type ResultatInvalidation =
+  | ResultatInvalidationSucces
+  | ResultatInvalidationRejet;
+
+export function queueAcDemandes(acId: string): string {
+  return `q.pki.ac.${acId}.demandes`;
+}
+
+export function routingKeyAc(acId: string): string {
+  return `ac.${acId}`;
+}
+
+export interface HierarchieAc {
+  generateurNumeroSerie: GenerateurNumeroSerie;
+  racine: AutoriteCertification;
+  directions: {
+    dsi: AutoriteCertification;
+    infra: AutoriteCertification;
+  };
+  services: {
+    dsiMessagerie: AutoriteCertification;
+    infraReseau: AutoriteCertification;
+  };
+  autorites: Map<string, AutoriteCertification>;
+}
+
+/**
+ * Générateur garantissant l'unicité des numéros de série des Certificats
+ * au sein de l'unique Domaine de confiance.
+ */
+export class GenerateurNumeroSerie {
+  private compteur = 0;
+  private readonly emis = new Set<string>();
+
+  generer(segmentOrganisation: string, annee = new Date().getUTCFullYear()): string {
+    const cleanSegment = segmentOrganisation
+      .replace(/^AC-/i, '')
+      .replace(/[^A-Za-z0-9]+/g, '-')
+      .replace(/^-|-$/g, '')
+      .toUpperCase();
+
+    let candidat: string;
+    do {
+      this.compteur += 1;
+      const suffixe = String(this.compteur).padStart(6, '0');
+      candidat = `SN-${annee}-${cleanSegment}-${suffixe}`;
+    } while (this.emis.has(candidat));
+
+    this.emis.add(candidat);
+    return candidat;
+  }
+
+  estDejaAttribue(numeroSerie: string): boolean {
+    return this.emis.has(numeroSerie);
+  }
+}
+
+export interface AutoriteCertificationConfig {
+  acId: string;
   nomOrganisationnel: string;
-  broker: InMemoryJmsBroker;
+  niveau: number;
+  acParenteId: string | null;
+  broker: InMemoryAmqpBroker;
+  generateurNumeroSerie: GenerateurNumeroSerie;
   keyPair?: RsaKeyPair;
-  numeroSerie?: string;
-  dateDebutValidite?: string;
-  dateFinValidite?: string;
+  horloge?: () => Date;
 }
 
-export interface CreerAcFilleOptions {
-  id: string;
-  nomOrganisationnel: string;
-  keyPair?: RsaKeyPair;
-  numeroSerie?: string;
-  dateDebutValidite?: string;
-  dateFinValidite?: string;
-}
-
-export interface SignerCertificatOptions {
-  numeroSerie: string;
-  sujet: string;
-  clePublique: string;
-  usage: UsageCle;
-  natureRessource?: string;
-  dateDebutValidite?: string;
-  dateFinValidite?: string;
-}
-
-export interface HierarchieAcResult {
-  acRacine: AutoriteCertification;
-  acsNiveau2: AutoriteCertification[];
-  acsNiveau3: AutoriteCertification[];
-  allAcs: AutoriteCertification[];
-}
-
+/**
+ * Autorité de Certification (AC) d'un niveau hiérarchique donné (1 = Racine, 2 = Direction, 3 = Service).
+ * N'expose aucune interface HTTP directe ; communique uniquement via AMQP 0-9-1.
+ */
 export class AutoriteCertification {
-  public readonly id: string;
-  public readonly nomOrganisationnel: string;
-  public readonly niveau: number;
-  public readonly acParenteId: string | null;
-  public readonly keyPair: RsaKeyPair;
-  public readonly certificat: Certificat;
-  public readonly broker: InMemoryJmsBroker;
-  public readonly certificatsValides = new Map<string, Certificat>();
-  public readonly statutCertificats = new Map<string, StatutCertificat>();
-  private entreesLcr = new Map<string, EntreeLcr>();
-  private lcrVersion = 0;
-  private compteurSerie = 1;
+  readonly acId: string;
+  readonly nomOrganisationnel: string;
+  readonly niveau: number;
+  readonly acParenteId: string | null;
 
-  constructor(params: {
-    id: string;
-    nomOrganisationnel: string;
-    niveau: number;
-    acParenteId: string | null;
-    keyPair: RsaKeyPair;
-    certificat: Certificat;
-    broker: InMemoryJmsBroker;
-  }) {
-    this.id = params.id;
-    this.nomOrganisationnel = params.nomOrganisationnel;
-    this.niveau = params.niveau;
-    this.acParenteId = params.acParenteId;
-    this.keyPair = params.keyPair;
-    this.certificat = params.certificat;
-    this.broker = params.broker;
+  private readonly broker: InMemoryAmqpBroker;
+  private readonly generateurNumeroSerie: GenerateurNumeroSerie;
+  private readonly keyPair: RsaKeyPair;
+  private readonly horloge: () => Date;
+  private certificatAc: Certificat | null = null;
+  private readonly certificatsEmis = new Map<string, Certificat>();
+  private numeroVersionLcr = 0;
+  private readonly entreesLcr = new Map<string, EntreeLcr>();
+  private lcrCourante: ListeCertificatsRevoques;
+  private commandeConsumerTag: string | null = null;
 
-    this.certificatsValides.set(this.certificat.numeroSerie, this.certificat);
-    this.statutCertificats.set(this.certificat.numeroSerie, 'VALIDE');
-    this.demarrerEcouteJms();
+  constructor(config: AutoriteCertificationConfig) {
+    this.acId = config.acId;
+    this.nomOrganisationnel = config.nomOrganisationnel;
+    this.niveau = config.niveau;
+    this.acParenteId = config.acParenteId;
+    this.broker = config.broker;
+    this.generateurNumeroSerie = config.generateurNumeroSerie;
+    this.keyPair = config.keyPair ?? generateRsaKeyPair();
+    this.horloge = config.horloge ?? (() => new Date());
+    this.lcrCourante = this.construireEtSignerLcr(this.horloge());
   }
 
-  public genererNumeroSerie(): string {
-    const cleanId = this.id.replace(/^AC-N\d+-/, '');
-    const num = String(this.compteurSerie++).padStart(6, '0');
-    return `SN-2026-${cleanId}-${num}`;
+  get clePubliqueBase64(): string {
+    return this.keyPair.publicKeyBase64;
   }
 
-  public demarrerEcouteJms(): void {
-    this.broker.registerQueueConsumer(
-      `queue.pki.ac.${this.id}.demandes`,
-      (message) => this.traiterDemandeQueue(message)
-    );
+  getCertificatAc(): Certificat {
+    if (!this.certificatAc) {
+      throw new Error(`Le certificat de l'AC "${this.acId}" n'a pas encore été émis.`);
+    }
+    return { ...this.certificatAc };
   }
 
-  public getLcr(): ListeCertificatsRevoques {
-    const now = new Date();
-    const nextUpdate = new Date(now.getTime() + 24 * 60 * 60 * 1000);
-    const entrees = Array.from(this.entreesLcr.values()).sort((a, b) =>
-      a.numeroSerieCertificat.localeCompare(b.numeroSerieCertificat)
-    );
-    const lcrData: Omit<ListeCertificatsRevoques, 'signatureAc'> = {
-      identifiantAc: this.id,
-      numeroVersionLcr: this.lcrVersion,
-      dateEmission: now.toISOString(),
-      prochaineMiseAJour: nextUpdate.toISOString(),
-      entrees,
-    };
-    return signLcr(lcrData, this.keyPair.privateKeyPem);
-  }
-
-  public revoquerCertificat(numeroSerie: string, motif?: string): DemandeRevocationReponse {
-    const res = this.changerStatutCertificat(numeroSerie, 'REVOCATION', motif);
-    if (!res.succes || !res.reponse) {
-      throw new Error(res.messageErreur ?? 'Échec de la révocation du certificat');
-    }
-    return res.reponse;
-  }
-
-  public changerStatutCertificat(
-    numeroSerie: string,
-    action: ActionRevocation,
-    motif?: string,
-    demandeId?: string
-  ): {
-    succes: boolean;
-    statusCode: number;
-    codeErreur?: string;
-    messageErreur?: string;
-    reponse?: DemandeRevocationReponse;
-  } {
-    const cert = this.certificatsValides.get(numeroSerie);
-    if (!cert) {
-      return {
-        succes: false,
-        statusCode: 404,
-        codeErreur: 'CERTIFICAT_INTROUVABLE',
-        messageErreur: `Le certificat '${numeroSerie}' est introuvable auprès de l'AC '${this.id}'.`,
-      };
-    }
-
-    // Expiration check
-    if (new Date(cert.dateFinValidite).getTime() < Date.now()) {
-      return {
-        succes: false,
-        statusCode: 409,
-        codeErreur: 'TRANSITION_INVALIDE',
-        messageErreur: "Impossible d'opérer sur un certificat expiré.",
-      };
-    }
-
-    const currentStatut = this.statutCertificats.get(numeroSerie) ?? 'VALIDE';
-
-    if (action === 'REVOCATION') {
-      if (currentStatut === 'REVOQUE') {
-        return {
-          succes: false,
-          statusCode: 409,
-          codeErreur: 'TRANSITION_INVALIDE',
-          messageErreur: 'Le certificat est déjà révoqué définitivement.',
-        };
-      }
-    } else if (action === 'SUSPENSION') {
-      if (currentStatut === 'REVOQUE') {
-        return {
-          succes: false,
-          statusCode: 409,
-          codeErreur: 'TRANSITION_INVALIDE',
-          messageErreur: 'Impossible de suspendre un certificat déjà révoqué définitivement.',
-        };
-      }
-      if (currentStatut === 'SUSPENDU') {
-        return {
-          succes: false,
-          statusCode: 409,
-          codeErreur: 'TRANSITION_INVALIDE',
-          messageErreur: 'Le certificat est déjà suspendu.',
-        };
-      }
-    } else if (action === 'REACTIVATION') {
-      if (currentStatut === 'REVOQUE') {
-        return {
-          succes: false,
-          statusCode: 409,
-          codeErreur: 'TRANSITION_INVALIDE',
-          messageErreur:
-            'Impossible de réactiver un certificat révoqué définitivement : la révocation est irréversible.',
-        };
-      }
-      if (currentStatut === 'VALIDE') {
-        return {
-          succes: false,
-          statusCode: 409,
-          codeErreur: 'TRANSITION_INVALIDE',
-          messageErreur: "Impossible de réactiver un certificat qui n'est pas suspendu.",
-        };
-      }
-    }
-
-    const now = new Date();
-    const nouveauStatut: StatutCertificat =
-      action === 'REACTIVATION'
-        ? 'VALIDE'
-        : action === 'SUSPENSION'
-        ? 'SUSPENDU'
-        : 'REVOQUE';
-
-    this.lcrVersion++;
-    this.statutCertificats.set(numeroSerie, nouveauStatut);
-
-    if (nouveauStatut === 'REVOQUE') {
-      this.entreesLcr.set(numeroSerie, {
-        numeroSerieCertificat: numeroSerie,
-        statut: 'REVOQUE',
-        dateInvalidation: now.toISOString(),
-        motif: motif ?? 'REVOCATION',
-      });
-    } else if (nouveauStatut === 'SUSPENDU') {
-      this.entreesLcr.set(numeroSerie, {
-        numeroSerieCertificat: numeroSerie,
-        statut: 'SUSPENDU',
-        dateInvalidation: now.toISOString(),
-        motif: motif ?? 'SUSPENSION_TEMPORAIRE',
-      });
-    } else if (nouveauStatut === 'VALIDE') {
-      this.entreesLcr.delete(numeroSerie);
-    }
-
-    const signedLcr = this.getLcr();
-
-    this.broker.publish('topic.pki.publications.lcr', {
-      headers: {
-        type_message: 'PUBLICATION_LCR',
-        ac_emettrice_id: this.id,
-        numero_serie_affecte: cert.numeroSerie,
-        nouveau_statut: nouveauStatut,
-      },
-      payload: {
-        identifiantAc: this.id,
-        numeroVersionLcr: signedLcr.numeroVersionLcr,
-        dateEmission: signedLcr.dateEmission,
-        prochaineMiseAJour: signedLcr.prochaineMiseAJour,
-        evenementDeclencheur: {
-          numeroSerieCertificat: cert.numeroSerie,
-          action,
-          nouveauStatut,
-          motif:
-            motif ??
-            (action === 'REVOCATION'
-              ? 'REVOCATION'
-              : action === 'SUSPENSION'
-              ? 'SUSPENSION_TEMPORAIRE'
-              : 'FIN_SUSPENSION'),
-          dateEffet: now.toISOString(),
-        },
-        entreesActives: Array.from(this.entreesLcr.values()),
-        lcr: signedLcr,
-        signatureAc: signedLcr.signatureAc,
-      },
-    });
-
-    const reponse: DemandeRevocationReponse = {
-      demandeId: demandeId ?? crypto.randomUUID(),
-      numeroSerieCertificat: cert.numeroSerie,
-      identifiantAc: this.id,
-      actionAppliquee: action,
-      nouvelEtatCertificat: nouveauStatut,
-      horodatagePublicationLcr: signedLcr.dateEmission,
-    };
-
+  getInfo(): AutoriteCertificationInfo {
     return {
-      succes: true,
-      statusCode: 200,
-      reponse,
-    };
-  }
-
-  public traiterDemandeQueue(message: JmsTextMessage): void {
-    const correlationId =
-      (message.headers.JMSCorrelationID as string) ||
-      (message.payload as any)?.demandeId;
-    const replyTo = message.headers.JMSReplyTo as string | undefined;
-    const typeMessage = message.headers.type_message as string;
-
-    if (typeMessage === 'DEMANDE_CERTIFICATION') {
-      const payload = message.payload as any;
-      const genererBicle = !!payload.genererBicle;
-      let clePublique = payload.clePublique;
-      let clePriveeGeneree: string | null = null;
-
-      if (genererBicle) {
-        const generatedKeyPair = generateRsaKeyPair();
-        clePublique = generatedKeyPair.publicKeyBase64;
-        clePriveeGeneree = generatedKeyPair.privateKeyPem;
-        // The private key is purely ephemeral: never stored in the AC instance
-      }
-
-      const numeroSerie = this.genererNumeroSerie();
-      const cert = this.signerCertificat({
-        numeroSerie,
-        sujet: payload.sujet,
-        clePublique,
-        usage: payload.usageAutorise ?? payload.usage,
-        natureRessource: payload.natureRessource,
-      });
-
-      if (replyTo) {
-        this.broker.sendToQueue(replyTo, {
-          headers: {
-            JMSCorrelationID: correlationId,
-            type_message: 'REPONSE_CERTIFICATION',
-            statut_traitement: 'SUCCES',
-            ac_emettrice_id: this.id,
-          },
-          payload: {
-            demandeId: correlationId,
-            statut: 'SUCCES',
-            certificat: cert,
-            clePriveeGeneree,
-          },
-        });
-      }
-    } else if (typeMessage === 'DEMANDE_REVOCATION') {
-      const payload = message.payload as any;
-      const result = this.changerStatutCertificat(
-        payload.numeroSerieCertificat,
-        payload.action,
-        payload.motif,
-        correlationId
-      );
-
-      if (replyTo) {
-        if (result.succes && result.reponse) {
-          this.broker.sendToQueue(replyTo, {
-            headers: {
-              JMSCorrelationID: correlationId,
-              type_message: 'REPONSE_REVOCATION',
-              statut_traitement: 'SUCCES',
-              ac_emettrice_id: this.id,
-            },
-            payload: {
-              demandeId: correlationId,
-              statut: 'SUCCES',
-              numeroSerieCertificat: result.reponse.numeroSerieCertificat,
-              identifiantAc: this.id,
-              actionAppliquee: result.reponse.actionAppliquee,
-              nouvelEtatCertificat: result.reponse.nouvelEtatCertificat,
-              numeroVersionLcr: this.lcrVersion,
-              horodatagePublicationLcr: result.reponse.horodatagePublicationLcr,
-            },
-          });
-        } else {
-          this.broker.sendToQueue(replyTo, {
-            headers: {
-              JMSCorrelationID: correlationId,
-              type_message: 'REPONSE_REVOCATION',
-              statut_traitement: 'REJET',
-              ac_emettrice_id: this.id,
-            },
-            payload: {
-              demandeId: correlationId,
-              statut: 'REJET',
-              statusCode: result.statusCode,
-              codeErreur: result.codeErreur,
-              messageErreur: result.messageErreur,
-              numeroSerieCertificat: payload.numeroSerieCertificat,
-              identifiantAc: this.id,
-            },
-          });
-        }
-      }
-    }
-  }
-
-
-  public getInfo(): AutoriteCertificationInfo {
-    return {
-      acId: this.id,
+      acId: this.acId,
       nomOrganisationnel: this.nomOrganisationnel,
       niveau: this.niveau,
       acParenteId: this.acParenteId,
-      certificatAc: this.certificat,
+      certificatAc: this.getCertificatAc()
     };
   }
 
-  public publierCertificat(cert: Certificat): void {
-    this.broker.publish('topic.pki.publications.certificats', {
+  getLcrCourante(): ListeCertificatsRevoques {
+    return {
+      ...this.lcrCourante,
+      entrees: this.lcrCourante.entrees.map((e) => ({ ...e }))
+    };
+  }
+
+  /**
+   * Auto-signe le certificat de l'AC Racine (niveau 1) et le publie sur ex.pki.publications.
+   */
+  async autoSignerRacine(options: OptionsValiditeAc = {}): Promise<Certificat> {
+    if (this.niveau !== 1 || this.acParenteId !== null) {
+      throw new Error(`Seule l'AC Racine de niveau 1 peut être auto-signée (${this.acId}).`);
+    }
+
+    const cert = this.signerCertificatAc(this.acId, this.keyPair.publicKeyBase64, options);
+    this.certificatAc = cert;
+    this.certificatsEmis.set(cert.numeroSerie, cert);
+
+    await this.publierCertificat(cert, this.getInfo());
+    return cert;
+  }
+
+  /**
+   * Émet et signe le certificat d'une AC Fille (niveau 2 ou 3) et le publie sur ex.pki.publications.
+   */
+  async certifierAcFille(
+    acFille: AutoriteCertification,
+    options: OptionsValiditeAc = {}
+  ): Promise<Certificat> {
+    if (acFille.acParenteId !== this.acId) {
+      throw new Error(
+        `Incohérence hiérarchique : "${acFille.acId}" a pour parente "${acFille.acParenteId}", pas "${this.acId}".`
+      );
+    }
+    if (!this.certificatAc) {
+      throw new Error(`L'AC parente "${this.acId}" doit être certifiée avant de signer "${acFille.acId}".`);
+    }
+
+    const cert = this.signerCertificatAc(acFille.acId, acFille.clePubliqueBase64, options);
+    this.certificatsEmis.set(cert.numeroSerie, cert);
+    acFille.definirCertificatAc(cert);
+
+    await acFille.publierCertificat(cert, acFille.getInfo());
+    return cert;
+  }
+
+  async publierLcr(): Promise<ListeCertificatsRevoques> {
+    const lcr = this.getLcrCourante();
+    const payload: PublicationLcrPayload = { lcr };
+    await this.broker.publish(
+      AMQP_EXCHANGES.PUBLICATIONS,
+      `lcr.${this.acId}`,
+      payload,
+      {
+        type: 'PUBLICATION_LCR',
+        headers: {
+          acId: this.acId,
+          niveau: this.niveau,
+          numeroVersionLcr: lcr.numeroVersionLcr
+        }
+      }
+    );
+    return lcr;
+  }
+
+  /**
+   * Applique une transition de cycle de vie (REVOCATION, SUSPENSION, REACTIVATION)
+   * sur un Certificat émis par cette AC (Porteur pour AC N3, ou AC Fille pour AC N1/N2),
+   * reconstruit et signe la LCR incrémentée puis la publie sur `ex.pki.publications`.
+   */
+  async traiterInvalidation(
+    numeroSerie: string,
+    action: ActionRevocation,
+    motif?: MotifRevocation,
+    dateCourante?: Date
+  ): Promise<ResultatInvalidation> {
+    const cert = this.certificatsEmis.get(numeroSerie);
+    if (!cert) {
+      return {
+        succes: false,
+        httpStatus: 404,
+        code: 'CERTIFICAT_INTROUVABLE',
+        message: `Aucun certificat émis par "${this.acId}" pour le numéro de série "${numeroSerie}".`
+      };
+    }
+
+    const maintenant = dateCourante ?? this.horloge();
+    if (maintenant.getTime() > new Date(cert.dateFinValidite).getTime()) {
+      return {
+        succes: false,
+        httpStatus: 409,
+        code: 'CERTIFICAT_EXPIRE',
+        message: `Le certificat "${numeroSerie}" est expiré depuis le ${cert.dateFinValidite}.`
+      };
+    }
+
+    const entreeCourante = this.entreesLcr.get(numeroSerie);
+    const etatCourant: StatutCertificat = entreeCourante ? entreeCourante.statut : 'VALIDE';
+
+    if (etatCourant === 'REVOQUE') {
+      return {
+        succes: false,
+        httpStatus: 409,
+        code: 'TRANSITION_INVALIDE',
+        message: `Le certificat "${numeroSerie}" est définitivement révoqué ; aucune transition ultérieure n'est autorisée.`
+      };
+    }
+
+    let nouvelEtat: StatutCertificat;
+
+    if (action === 'SUSPENSION') {
+      if (etatCourant !== 'VALIDE') {
+        return {
+          succes: false,
+          httpStatus: 409,
+          code: 'TRANSITION_INVALIDE',
+          message: `Impossible de suspendre le certificat "${numeroSerie}" depuis l'état "${etatCourant}".`
+        };
+      }
+      nouvelEtat = 'SUSPENDU';
+      this.entreesLcr.set(numeroSerie, {
+        numeroSerieCertificat: numeroSerie,
+        statut: 'SUSPENDU',
+        dateInvalidation: maintenant.toISOString(),
+        motif: motif ?? 'SUSPENSION_TEMPORAIRE'
+      });
+    } else if (action === 'REACTIVATION') {
+      if (etatCourant !== 'SUSPENDU') {
+        return {
+          succes: false,
+          httpStatus: 409,
+          code: 'TRANSITION_INVALIDE',
+          message: `Impossible de réactiver le certificat "${numeroSerie}" depuis l'état "${etatCourant}".`
+        };
+      }
+      nouvelEtat = 'VALIDE';
+      this.entreesLcr.delete(numeroSerie);
+    } else if (action === 'REVOCATION') {
+      nouvelEtat = 'REVOQUE';
+      this.entreesLcr.set(numeroSerie, {
+        numeroSerieCertificat: numeroSerie,
+        statut: 'REVOQUE',
+        dateInvalidation: maintenant.toISOString(),
+        motif: motif ?? 'AUTRE'
+      });
+    } else {
+      return {
+        succes: false,
+        httpStatus: 409,
+        code: 'TRANSITION_INVALIDE',
+        message: `Action de révocation inconnue : "${String(action)}".`
+      };
+    }
+
+    this.lcrCourante = this.construireEtSignerLcr(maintenant);
+    const lcr = await this.publierLcr();
+
+    return {
+      succes: true,
+      numeroSerieCertificat: numeroSerie,
+      identifiantAc: this.acId,
+      actionAppliquee: action,
+      nouvelEtatCertificat: nouvelEtat,
+      horodatagePublicationLcr: lcr.dateEmission,
+      lcr
+    };
+  }
+
+  protected definirCertificatAc(certificat: Certificat): void {
+    this.certificatAc = certificat;
+  }
+
+  declarerFileCommandes(): void {
+    if (this.niveau !== 3) {
+      throw new Error(`Seule une AC de niveau 3 peut déclarer une file de demandes (${this.acId}).`);
+    }
+    this.broker.declareExchange(AMQP_EXCHANGES.COMMANDES, 'direct', { durable: true });
+    this.broker.declareQueue(queueAcDemandes(this.acId), { durable: true });
+    this.broker.bindQueue(
+      queueAcDemandes(this.acId),
+      AMQP_EXCHANGES.COMMANDES,
+      routingKeyAc(this.acId)
+    );
+  }
+
+  /**
+   * Démarre ou reprend la consommation de la file AMQP `q.pki.ac.<id_ac>.demandes`.
+   */
+  async reprendreConsommation(): Promise<void> {
+    if (this.niveau !== 3) {
+      throw new Error(`Seule une AC de niveau 3 peut consommer des commandes (${this.acId}).`);
+    }
+    this.declarerFileCommandes();
+    if (this.commandeConsumerTag !== null) {
+      return;
+    }
+    this.commandeConsumerTag = await this.broker.consume(
+      queueAcDemandes(this.acId),
+      async (message) => {
+        await this.traiterCommandeAmqp(message);
+      }
+    );
+  }
+
+  /**
+   * Suspend temporairement la consommation des commandes AMQP (laisse les messages en file FIFO).
+   */
+  suspendreConsommation(): void {
+    if (this.niveau !== 3) {
+      throw new Error(`Seule une AC de niveau 3 peut suspendre sa consommation (${this.acId}).`);
+    }
+    if (this.commandeConsumerTag !== null) {
+      this.broker.unsubscribe(queueAcDemandes(this.acId), this.commandeConsumerTag);
+      this.commandeConsumerTag = null;
+    }
+  }
+
+  protected async publierCertificat(
+    certificat: Certificat,
+    autoriteInfo?: AutoriteCertificationInfo
+  ): Promise<void> {
+    const payload: PublicationCertificatPayload = {
+      certificat,
+      ...(autoriteInfo ? { autoriteInfo } : {})
+    };
+    const routingKey = autoriteInfo
+      ? `certificat.n${this.niveau}.ac`
+      : `certificat.n${this.niveau}.${certificat.natureRessource ?? 'porteur'}`;
+
+    await this.broker.publish(AMQP_EXCHANGES.PUBLICATIONS, routingKey, payload, {
+      type: 'PUBLICATION_CERTIFICAT',
       headers: {
-        type_message: 'PUBLICATION_CERTIFICAT',
-        ac_emettrice_id: cert.identifiantAcEmettrice,
-        niveau_ac: cert.niveauAcEmettrice ?? this.niveau,
-        nature_ressource: cert.natureRessource ?? 'autorite_certification',
-        numero_serie: cert.numeroSerie,
+        acId: this.acId,
+        niveau: this.niveau
+      }
+    });
+  }
+
+  private async traiterCommandeAmqp(message: AmqpMessage): Promise<void> {
+    if (message.properties.type === 'DEMANDE_CERTIFICATION') {
+      await this.traiterDemandeCertificationAmqp(message);
+      return;
+    }
+    if (message.properties.type === 'DEMANDE_REVOCATION') {
+      await this.traiterDemandeRevocationAmqp(message);
+      return;
+    }
+  }
+
+  private async traiterDemandeRevocationAmqp(message: AmqpMessage): Promise<void> {
+    const payload = message.payload as Partial<CommandeDemandeRevocationPayload> | null;
+    const correlationId = message.properties.correlation_id ?? payload?.demandeId;
+    const replyTo = message.properties.reply_to;
+
+    if (
+      !payload ||
+      !payload.demandeId ||
+      !payload.numeroSerieCertificat ||
+      (payload.action !== 'REVOCATION' &&
+        payload.action !== 'SUSPENSION' &&
+        payload.action !== 'REACTIVATION')
+    ) {
+      if (replyTo && correlationId) {
+        await this.publierReponseRevocation(replyTo, correlationId, {
+          demandeId: payload?.demandeId ?? correlationId,
+          numeroSerieCertificat: payload?.numeroSerieCertificat ?? '',
+          identifiantAc: this.acId,
+          statut: 'REJETEE',
+          erreur: {
+            httpStatus: 400,
+            code: 'COMMANDE_INVALIDE',
+            message: 'Commande DEMANDE_REVOCATION incomplète.'
+          }
+        });
+      }
+      return;
+    }
+
+    const resultat = await this.traiterInvalidation(
+      payload.numeroSerieCertificat,
+      payload.action,
+      payload.motif
+    );
+
+    if (!replyTo || !correlationId) {
+      return;
+    }
+
+    if (!resultat.succes) {
+      await this.publierReponseRevocation(replyTo, correlationId, {
+        demandeId: payload.demandeId,
+        numeroSerieCertificat: payload.numeroSerieCertificat,
+        identifiantAc: this.acId,
+        statut: 'REJETEE',
+        erreur: {
+          httpStatus: resultat.httpStatus,
+          code: resultat.code,
+          message: resultat.message
+        }
+      });
+      return;
+    }
+
+    await this.publierReponseRevocation(replyTo, correlationId, {
+      demandeId: payload.demandeId,
+      numeroSerieCertificat: resultat.numeroSerieCertificat,
+      identifiantAc: resultat.identifiantAc,
+      statut: 'APPLIQUEE',
+      actionAppliquee: resultat.actionAppliquee,
+      nouvelEtatCertificat: resultat.nouvelEtatCertificat,
+      horodatagePublicationLcr: resultat.horodatagePublicationLcr
+    });
+  }
+
+  private async traiterDemandeCertificationAmqp(message: AmqpMessage): Promise<void> {
+    const payload = message.payload as Partial<CommandeDemandeCertificationPayload> | null;
+    const correlationId = message.properties.correlation_id ?? payload?.demandeId;
+    const replyTo = message.properties.reply_to;
+
+    if (!payload || !payload.demandeId || !payload.sujet || !payload.usage) {
+      await this.repondreRejet(
+        replyTo,
+        correlationId,
+        payload?.demandeId ?? correlationId,
+        'COMMANDE_INVALIDE',
+        'Commande DEMANDE_CERTIFICATION incomplète.'
+      );
+      return;
+    }
+
+    if (!this.certificatAc) {
+      await this.repondreRejet(
+        replyTo,
+        correlationId,
+        payload.demandeId,
+        'AC_NON_CERTIFIEE',
+        `L'AC "${this.acId}" n'est pas encore certifiée.`
+      );
+      return;
+    }
+
+    if (payload.usage === 'CERTIFICATION_AC') {
+      await this.repondreRejet(
+        replyTo,
+        correlationId,
+        payload.demandeId,
+        'USAGE_INTERDIT',
+        'Un Porteur ne peut pas obtenir un certificat CERTIFICATION_AC.'
+      );
+      return;
+    }
+
+    let clePubliqueBase64: string;
+    let clePriveeEphemeral: string | null = null;
+
+    if (payload.genererBicle) {
+      const bicle = generateRsaKeyPair();
+      clePubliqueBase64 = bicle.publicKeyBase64;
+      clePriveeEphemeral = bicle.privateKeyPem;
+    } else if (typeof payload.clePublique === 'string' && payload.clePublique.trim() !== '') {
+      clePubliqueBase64 = publicKeyPemToBase64(payload.clePublique);
+    } else {
+      await this.repondreRejet(
+        replyTo,
+        correlationId,
+        payload.demandeId,
+        'CLE_PUBLIQUE_MANQUANTE',
+        'Aucune clé publique fournie pour la demande.'
+      );
+      return;
+    }
+
+    const debut = this.horloge();
+    const dureeJours = payload.dureeValiditeJours ?? 365;
+    const fin = new Date(debut.getTime() + dureeJours * 24 * 60 * 60 * 1000);
+
+    const certificat = signCertificat(
+      {
+        numeroSerie: this.generateurNumeroSerie.generer(this.acId, debut.getUTCFullYear()),
+        identifiantAcEmettrice: this.acId,
+        niveauAcEmettrice: this.niveau,
+        dateDebutValidite: debut.toISOString(),
+        dateFinValidite: fin.toISOString(),
+        usage: payload.usage,
+        sujet: payload.sujet,
+        ...(payload.natureRessource ? { natureRessource: payload.natureRessource } : {}),
+        clePublique: clePubliqueBase64,
+        algorithmeSignature: 'SHA256withRSA'
       },
-      payload: cert,
+      this.keyPair.privateKeyPem
+    );
+
+    this.certificatsEmis.set(certificat.numeroSerie, certificat);
+
+    await this.publierCertificat(certificat);
+
+    if (replyTo && correlationId) {
+      await this.publierReponseCertification(replyTo, correlationId, {
+        demandeId: payload.demandeId,
+        statut: 'EMISE',
+        certificat,
+        clePriveeGeneree: clePriveeEphemeral
+      });
+    }
+  }
+
+  private async repondreRejet(
+    replyTo: string | undefined,
+    correlationId: string | undefined,
+    demandeId: string | undefined,
+    code: string,
+    message: string
+  ): Promise<void> {
+    if (!replyTo || !correlationId) {
+      return;
+    }
+    await this.publierReponseCertification(replyTo, correlationId, {
+      demandeId: demandeId ?? correlationId,
+      statut: 'REJETEE',
+      clePriveeGeneree: null,
+      erreur: { code, message }
     });
   }
 
-  public signerCertificat(options: SignerCertificatOptions): Certificat {
-    const now = new Date();
-    const oneYearLater = new Date(now.getTime() + 365 * 24 * 60 * 60 * 1000);
-
-    const certData: Omit<Certificat, 'signatureAc'> = {
-      numeroSerie: options.numeroSerie,
-      identifiantAcEmettrice: this.id,
-      niveauAcEmettrice: this.niveau,
-      dateDebutValidite: options.dateDebutValidite ?? now.toISOString(),
-      dateFinValidite: options.dateFinValidite ?? oneYearLater.toISOString(),
-      usage: options.usage,
-      sujet: options.sujet,
-      natureRessource: options.natureRessource,
-      clePublique: options.clePublique,
-      algorithmeSignature: 'SHA256withRSA',
-    };
-
-    const signedCert = signCertificat(certData, this.keyPair.privateKeyPem);
-    this.certificatsValides.set(signedCert.numeroSerie, signedCert);
-    this.statutCertificats.set(signedCert.numeroSerie, 'VALIDE');
-    this.publierCertificat(signedCert);
-    return signedCert;
-
-  }
-
-  public creerAcFille(options: CreerAcFilleOptions): AutoriteCertification {
-    const childKeyPair = options.keyPair ?? generateRsaKeyPair();
-    const childNiveau = this.niveau + 1;
-    const now = new Date();
-    const fiveYearsLater = new Date(now.getTime() + 5 * 365 * 24 * 60 * 60 * 1000);
-
-    const certData: Omit<Certificat, 'signatureAc'> = {
-      numeroSerie: options.numeroSerie ?? `SN-AC-N${childNiveau}-${options.id}`,
-      identifiantAcEmettrice: this.id,
-      niveauAcEmettrice: this.niveau,
-      dateDebutValidite: options.dateDebutValidite ?? now.toISOString(),
-      dateFinValidite: options.dateFinValidite ?? fiveYearsLater.toISOString(),
-      usage: 'CERTIFICATION_AC',
-      sujet: options.id,
-      natureRessource: 'autorite_certification',
-      clePublique: childKeyPair.publicKeyBase64,
-      algorithmeSignature: 'SHA256withRSA',
-    };
-
-    const signedCert = signCertificat(certData, this.keyPair.privateKeyPem);
-    this.certificatsValides.set(signedCert.numeroSerie, signedCert);
-    this.statutCertificats.set(signedCert.numeroSerie, 'VALIDE');
-    this.publierCertificat(signedCert);
-
-    return new AutoriteCertification({
-      id: options.id,
-      nomOrganisationnel: options.nomOrganisationnel,
-      niveau: childNiveau,
-      acParenteId: this.id,
-      keyPair: childKeyPair,
-      certificat: signedCert,
-      broker: this.broker,
+  private async publierReponseCertification(
+    replyTo: string,
+    correlationId: string,
+    payload: ReponseDemandeCertificationPayload
+  ): Promise<void> {
+    await this.broker.publish(AMQP_EXCHANGES.COMMANDES, replyTo, payload, {
+      type: 'REPONSE_CERTIFICATION',
+      correlation_id: correlationId,
+      headers: {
+        acId: this.acId
+      }
     });
   }
 
-  public static createRoot(options: CreateRootOptions): AutoriteCertification {
-    const rootKeyPair = options.keyPair ?? generateRsaKeyPair();
-    const now = new Date();
-    const tenYearsLater = new Date(now.getTime() + 10 * 365 * 24 * 60 * 60 * 1000);
-
-    const certData: Omit<Certificat, 'signatureAc'> = {
-      numeroSerie: options.numeroSerie ?? `SN-AC-N1-ROOT`,
-      identifiantAcEmettrice: options.id,
-      niveauAcEmettrice: 1,
-      dateDebutValidite: options.dateDebutValidite ?? now.toISOString(),
-      dateFinValidite: options.dateFinValidite ?? tenYearsLater.toISOString(),
-      usage: 'CERTIFICATION_AC',
-      sujet: options.id,
-      natureRessource: 'autorite_certification',
-      clePublique: rootKeyPair.publicKeyBase64,
-      algorithmeSignature: 'SHA256withRSA',
-    };
-
-    const selfSignedCert = signCertificat(certData, rootKeyPair.privateKeyPem);
-
-    const rootAc = new AutoriteCertification({
-      id: options.id,
-      nomOrganisationnel: options.nomOrganisationnel,
-      niveau: 1,
-      acParenteId: null,
-      keyPair: rootKeyPair,
-      certificat: selfSignedCert,
-      broker: options.broker,
+  private async publierReponseRevocation(
+    replyTo: string,
+    correlationId: string,
+    payload: ReponseDemandeRevocationPayload
+  ): Promise<void> {
+    await this.broker.publish(AMQP_EXCHANGES.COMMANDES, replyTo, payload, {
+      type: 'REPONSE_REVOCATION',
+      correlation_id: correlationId,
+      headers: {
+        acId: this.acId
+      }
     });
+  }
 
-    rootAc.publierCertificat(selfSignedCert);
-    return rootAc;
+  private signerCertificatAc(
+    sujetAcId: string,
+    clePubliqueBase64: string,
+    options: OptionsValiditeAc
+  ): Certificat {
+    const debut = options.dateDebut ?? this.horloge();
+    const dureeJours = options.dureeValiditeJours ?? 3650;
+    const fin = new Date(debut.getTime() + dureeJours * 24 * 60 * 60 * 1000);
+
+    return signCertificat(
+      {
+        numeroSerie: this.generateurNumeroSerie.generer(sujetAcId, debut.getUTCFullYear()),
+        identifiantAcEmettrice: this.acId,
+        niveauAcEmettrice: this.niveau,
+        dateDebutValidite: debut.toISOString(),
+        dateFinValidite: fin.toISOString(),
+        usage: 'CERTIFICATION_AC',
+        sujet: sujetAcId,
+        natureRessource: 'autorite_certification',
+        clePublique: clePubliqueBase64,
+        algorithmeSignature: 'SHA256withRSA'
+      },
+      this.keyPair.privateKeyPem
+    );
+  }
+
+  private construireEtSignerLcr(dateEmission: Date): ListeCertificatsRevoques {
+    this.numeroVersionLcr += 1;
+    const prochaineMiseAJour = new Date(dateEmission.getTime() + 24 * 60 * 60 * 1000);
+    return signLcr(
+      {
+        identifiantAc: this.acId,
+        numeroVersionLcr: this.numeroVersionLcr,
+        dateEmission: dateEmission.toISOString(),
+        prochaineMiseAJour: prochaineMiseAJour.toISOString(),
+        entrees: Array.from(this.entreesLcr.values())
+      },
+      this.keyPair.privateKeyPem
+    );
   }
 }
 
-export function bootstrapHierarchieAc(broker: InMemoryJmsBroker): HierarchieAcResult {
-  const acRacine = AutoriteCertification.createRoot({
-    id: 'AC-N1-RACINE',
-    nomOrganisationnel: 'Direction Générale — Autorité Racine',
+/**
+ * Amorce la hiérarchie complète d'AC sur 3 niveaux dans le Domaine de confiance :
+ * - Niveau 1 : AC-N1-RACINE (auto-signée)
+ * - Niveau 2 : AC-N2-DSI, AC-N2-INFRA
+ * - Niveau 3 : AC-N3-DSI-MESSAGERIE, AC-N3-INFRA-RESEAU
+ */
+export async function amorcerHierarchieAc(
+  broker: InMemoryAmqpBroker,
+  options: OptionsValiditeAc = {}
+): Promise<HierarchieAc> {
+  broker.declareExchange(AMQP_EXCHANGES.COMMANDES, 'direct', { durable: true });
+  broker.declareExchange(AMQP_EXCHANGES.PUBLICATIONS, 'topic', { durable: true });
+
+  const generateurNumeroSerie = new GenerateurNumeroSerie();
+
+  const racine = new AutoriteCertification({
+    acId: 'AC-N1-RACINE',
+    nomOrganisationnel: 'AC Racine — Domaine de Confiance Organisationnel',
+    niveau: 1,
+    acParenteId: null,
     broker,
+    generateurNumeroSerie,
+    ...(options.horloge ? { horloge: options.horloge } : {})
   });
 
-  const acN2Dsi = acRacine.creerAcFille({
-    id: 'AC-N2-DSI',
-    nomOrganisationnel: 'Direction des Systèmes d’Information',
+  const dsi = new AutoriteCertification({
+    acId: 'AC-N2-DSI',
+    nomOrganisationnel: "Direction des Systèmes d'Information",
+    niveau: 2,
+    acParenteId: 'AC-N1-RACINE',
+    broker,
+    generateurNumeroSerie,
+    ...(options.horloge ? { horloge: options.horloge } : {})
   });
 
-  const acN2Infra = acRacine.creerAcFille({
-    id: 'AC-N2-INFRA',
-    nomOrganisationnel: 'Direction des Infrastructures',
+  const infra = new AutoriteCertification({
+    acId: 'AC-N2-INFRA',
+    nomOrganisationnel: 'Direction Infrastructure et Réseaux',
+    niveau: 2,
+    acParenteId: 'AC-N1-RACINE',
+    broker,
+    generateurNumeroSerie,
+    ...(options.horloge ? { horloge: options.horloge } : {})
   });
 
-  const acN3Msg = acN2Dsi.creerAcFille({
-    id: 'AC-N3-DSI-MESSAGERIE',
-    nomOrganisationnel: 'Direction des Systèmes d’Information — Service Messagerie',
+  const dsiMessagerie = new AutoriteCertification({
+    acId: 'AC-N3-DSI-MESSAGERIE',
+    nomOrganisationnel: "Direction des Systèmes d'Information — Service Messagerie",
+    niveau: 3,
+    acParenteId: 'AC-N2-DSI',
+    broker,
+    generateurNumeroSerie,
+    ...(options.horloge ? { horloge: options.horloge } : {})
   });
 
-  const acN3Etudes = acN2Dsi.creerAcFille({
-    id: 'AC-N3-DSI-ETUDES',
-    nomOrganisationnel: 'Direction des Systèmes d’Information — Service Études et Développement',
+  const infraReseau = new AutoriteCertification({
+    acId: 'AC-N3-INFRA-RESEAU',
+    nomOrganisationnel: 'Direction Infrastructure et Réseaux — Service Réseau',
+    niveau: 3,
+    acParenteId: 'AC-N2-INFRA',
+    broker,
+    generateurNumeroSerie,
+    ...(options.horloge ? { horloge: options.horloge } : {})
   });
 
-  const acN3Reseau = acN2Infra.creerAcFille({
-    id: 'AC-N3-INFRA-RESEAU',
-    nomOrganisationnel: 'Direction des Infrastructures — Service Réseau et Télécoms',
-  });
+  await racine.autoSignerRacine(options);
+  await racine.certifierAcFille(dsi, options);
+  await racine.certifierAcFille(infra, options);
+  await dsi.certifierAcFille(dsiMessagerie, options);
+  await infra.certifierAcFille(infraReseau, options);
 
-  const acsNiveau2 = [acN2Dsi, acN2Infra];
-  const acsNiveau3 = [acN3Msg, acN3Etudes, acN3Reseau];
-  const allAcs = [acRacine, ...acsNiveau2, ...acsNiveau3];
+  // Publication initiale des LCR vides signées pour chaque AC
+  await racine.publierLcr();
+  await dsi.publierLcr();
+  await infra.publierLcr();
+  await dsiMessagerie.publierLcr();
+  await infraReseau.publierLcr();
+
+  await dsiMessagerie.reprendreConsommation();
+  await infraReseau.reprendreConsommation();
+
+  const autorites = new Map<string, AutoriteCertification>([
+    [racine.acId, racine],
+    [dsi.acId, dsi],
+    [infra.acId, infra],
+    [dsiMessagerie.acId, dsiMessagerie],
+    [infraReseau.acId, infraReseau]
+  ]);
 
   return {
-    acRacine,
-    acsNiveau2,
-    acsNiveau3,
-    allAcs,
+    generateurNumeroSerie,
+    racine,
+    directions: { dsi, infra },
+    services: { dsiMessagerie, infraReseau },
+    autorites
   };
 }

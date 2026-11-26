@@ -1,219 +1,240 @@
-import type {
-  RestRequest,
-  RestResponse,
-  ErreurApi,
-} from '../types/index.js';
-import { ServiceDiscoveryRegistry } from './discovery.js';
-import { ConfigurationServer } from './config-server.js';
+import type { RestRequest, RestResponse, RestTransport } from '../types/index.js';
+import type { ConfigurationServer } from './config-server.js';
+import {
+  buildRestError,
+  getHeaderCaseInsensitive,
+  normalizeRestPath
+} from '../utils/http.js';
 import { RateLimiter } from './rate-limiter.js';
-import type { ApiGatewayOptions, RateLimitOptions } from './types.js';
+import type { ServiceDiscovery } from './service-discovery.js';
 
+export interface ApiGatewayConfig {
+  serviceDiscovery: ServiceDiscovery;
+  configurationServer?: ConfigurationServer;
+  exigerTls?: boolean;
+  rateLimiter?: RateLimiter;
+  activerCache?: boolean;
+  horloge?: () => Date;
+}
+
+function isSensitiveAePostRoute(method: string, normalizedPath: string): boolean {
+  if (method !== 'POST') {
+    return false;
+  }
+  return (
+    /^\/ae\/[^/]+\/demandes-certification$/.test(normalizedPath) ||
+    /^\/ae\/[^/]+\/demandes-revocation$/.test(normalizedPath)
+  );
+}
+
+function isCacheableGetRoute(method: string, normalizedPath: string): boolean {
+  if (method !== 'GET') {
+    return false;
+  }
+  return (
+    normalizedPath === '/config/ancre-racine' ||
+    /^\/annuaire\/certificats\/[^/]+\/chemin-certification$/.test(normalizedPath)
+  );
+}
+
+function cloneResponse(res: RestResponse): RestResponse {
+  return {
+    status: res.status,
+    body: res.body === undefined ? undefined : JSON.parse(JSON.stringify(res.body)),
+    ...(res.headers ? { headers: { ...res.headers } } : {})
+  };
+}
+
+/**
+ * API Gateway Edge : point d'entrée REST unique routant `/ae/{nature}/...`,
+ * `/av/{nature}/...`, `/annuaire/...` et `/config/...` via le `ServiceDiscovery`
+ * et le `ConfigurationServer`, avec contrôle TLS optionnel, limitation de débit (429)
+ * et mise en cache des réponses immuables (`X-Cache: MISS|HIT`).
+ */
 export class ApiGateway {
-  public readonly discovery: ServiceDiscoveryRegistry;
-  public readonly configServer?: ConfigurationServer;
-  public readonly rateLimiter: RateLimiter;
-  public readonly enforceTls: boolean;
-  private edgeCache = new Map<string, { body: any; status: number; expiresAt: number }>();
-  private cacheTtlMs: number = 30_000;
+  private readonly serviceDiscovery: ServiceDiscovery;
+  private readonly configurationServer: ConfigurationServer | undefined;
+  private readonly exigerTls: boolean;
+  private readonly rateLimiter: RateLimiter;
+  private readonly activerCache: boolean;
+  private readonly horloge: () => Date;
+  private readonly cache = new Map<string, RestResponse>();
 
-  constructor(options: ApiGatewayOptions) {
-    this.discovery = options.discovery;
-    this.configServer = options.configServer;
-    this.rateLimiter = new RateLimiter(options.rateLimitOptions);
-    this.enforceTls = options.enforceTls ?? false;
+  constructor(config: ApiGatewayConfig) {
+    this.serviceDiscovery = config.serviceDiscovery;
+    this.configurationServer = config.configurationServer;
+    this.exigerTls = config.exigerTls ?? false;
+    this.rateLimiter = config.rateLimiter ?? new RateLimiter({ horloge: config.horloge });
+    this.activerCache = config.activerCache ?? true;
+    this.horloge = config.horloge ?? (() => new Date());
   }
 
-  public setRateLimitOptions(options: Partial<RateLimitOptions>): void {
-    this.rateLimiter.setOptions(options);
+  transport(defaultHeaders?: Record<string, string>): RestTransport {
+    if (!defaultHeaders) {
+      return (req: RestRequest) => this.handleRequest(req);
+    }
+    return (req: RestRequest) =>
+      this.handleRequest({
+        ...req,
+        headers: {
+          ...defaultHeaders,
+          ...(req.headers ?? {})
+        }
+      });
   }
 
-  public resetRateLimits(): void {
-    this.rateLimiter.reset();
+  viderCache(): void {
+    this.cache.clear();
   }
 
-  public clearCache(): void {
-    this.edgeCache.clear();
-  }
+  async handleRequest(req: RestRequest): Promise<RestResponse> {
+    const nowIso = this.horloge().toISOString();
 
-  public async handleRequest(req: RestRequest): Promise<RestResponse> {
-    // 0. TLS Enforcement Check
-    if (this.enforceTls) {
-      const forwardedProto =
-        req.headers?.['x-forwarded-proto'] ?? req.headers?.['X-Forwarded-Proto'];
-      if (!forwardedProto || String(forwardedProto).toLowerCase() !== 'https') {
-        const err: ErreurApi = {
-          code: 'TLS_REQUIS',
-          message:
-            "Connexion sécurisée requise : l'en-tête X-Forwarded-Proto doit être 'https'.",
-          horodatage: new Date().toISOString(),
-          chemin: req.path,
-        };
-        return {
-          status: 403,
-          headers: { 'Content-Type': 'application/json' },
-          body: err,
-        };
+    if (this.exigerTls) {
+      const proto = getHeaderCaseInsensitive(req.headers, 'x-forwarded-proto');
+      if (proto?.trim().toLowerCase() !== 'https') {
+        return buildRestError(
+          403,
+          'TLS_REQUIS',
+          'Une connexion TLS (HTTPS) est obligatoire pour accéder à l’API Gateway.',
+          req.path,
+          nowIso
+        );
       }
     }
 
-    const cleanPath = req.path.split('?')[0].replace(/\/+$/, '');
+    const method = req.method.toUpperCase();
+    const normalizedPath = normalizeRestPath(req.path);
 
-    // 1. Rate Limiting Check on Sensitive Endpoints
-    if (this.isSensitiveEndpoint(req.method, cleanPath)) {
-      const clientKey = this.rateLimiter.extractKey(req);
-      const rateStatus = this.rateLimiter.record(clientKey);
-
-      if (!rateStatus.allowed) {
-        const err: ErreurApi = {
-          code: 'RATE_LIMIT_EXCEEDED',
-          message:
-            'Limite de requêtes atteinte (rate limit exceeded). Veuillez réessayer ultérieurement.',
-          horodatage: new Date().toISOString(),
-          chemin: req.path,
-        };
-        const retryAfterSeconds = Math.max(1, Math.ceil(rateStatus.resetMs / 1000));
+    if (isSensitiveAePostRoute(method, normalizedPath)) {
+      const clientKey =
+        getHeaderCaseInsensitive(req.headers, 'x-forwarded-for') ??
+        getHeaderCaseInsensitive(req.headers, 'x-client-id') ??
+        'client-defaut';
+      const decision = this.rateLimiter.verifierEtConsommer(
+        `${clientKey}:${normalizedPath}`
+      );
+      if (!decision.autorise) {
+        const retryAfterSec = Math.max(1, Math.ceil(decision.reinitialisationMs / 1000));
         return {
           status: 429,
           headers: {
-            'Content-Type': 'application/json',
-            'Retry-After': String(retryAfterSeconds),
-            'X-RateLimit-Limit': String(rateStatus.limit),
-            'X-RateLimit-Remaining': String(rateStatus.remaining),
-            'X-RateLimit-Reset': String(retryAfterSeconds),
+            'Retry-After': String(retryAfterSec),
+            'X-RateLimit-Limit': String(decision.limite),
+            'X-RateLimit-Remaining': '0'
           },
-          body: err,
+          body: {
+            code: 'TROP_DE_REQUETES',
+            message: `Limite de débit dépassée sur "${normalizedPath}". Réessayez ultérieurement.`,
+            horodatage: nowIso,
+            chemin: req.path
+          }
         };
       }
     }
 
-    // 2. Cache lookup for cacheable GET requests (e.g. annuaire certification chains)
-    if (req.method === 'GET' && this.isCacheablePath(cleanPath)) {
-      const cached = this.edgeCache.get(cleanPath);
-      if (cached && cached.expiresAt > Date.now()) {
+    const cacheable = this.activerCache && isCacheableGetRoute(method, normalizedPath);
+    const cacheKey = `${method}:${normalizedPath}`;
+    if (cacheable) {
+      const cached = this.cache.get(cacheKey);
+      if (cached) {
+        const cloned = cloneResponse(cached);
         return {
-          status: cached.status,
+          ...cloned,
           headers: {
-            'Content-Type': 'application/json',
-            'X-Cache': 'HIT',
-          },
-          body: cached.body,
+            ...(cloned.headers ?? {}),
+            'X-Cache': 'HIT'
+          }
         };
       }
     }
 
-    // 3. Routing: /ae/{nature}/...
-    const aeMatch = cleanPath.match(/^\/ae\/([^/]+)(\/.*)?$/);
-    if (aeMatch) {
-      const nature = aeMatch[1];
-      const ae = this.discovery.getAe(nature);
+    const response = await this.routerRequete(req, normalizedPath, nowIso);
+
+    if (cacheable && response.status === 200) {
+      this.cache.set(cacheKey, cloneResponse(response));
+      return {
+        ...response,
+        headers: {
+          ...(response.headers ?? {}),
+          'X-Cache': 'MISS'
+        }
+      };
+    }
+
+    return response;
+  }
+
+  private async routerRequete(
+    req: RestRequest,
+    normalizedPath: string,
+    nowIso: string
+  ): Promise<RestResponse> {
+    const aeMatch = /^\/ae\/([^/]+)(?:\/.*)?$/.exec(normalizedPath);
+    if (aeMatch && aeMatch[1]) {
+      const nature = decodeURIComponent(aeMatch[1]);
+      const ae = this.serviceDiscovery.resoudreAe(nature);
       if (!ae) {
-        const err: ErreurApi = {
-          code: 'NATURE_NON_SUPPORTEE',
-          message: `La nature '${nature}' n'est pas supportée ou aucune Autorité d'Enregistrement n'est enregistrée pour cette nature.`,
-          horodatage: new Date().toISOString(),
-          chemin: req.path,
-        };
-        return {
-          status: 404,
-          headers: { 'Content-Type': 'application/json' },
-          body: err,
-        };
+        return buildRestError(
+          404,
+          'NATURE_INTROUVABLE',
+          `Aucune Autorité d'Enregistrement enregistrée pour la nature "${nature}".`,
+          req.path,
+          nowIso
+        );
       }
-      return ae.handleRequest(req);
+      return ae.handleRestRequest(req);
     }
 
-    // 4. Routing: /av/{nature}/...
-    const avMatch = cleanPath.match(/^\/av\/([^/]+)(\/.*)?$/);
-    if (avMatch) {
-      const nature = avMatch[1];
-      const av = this.discovery.getAv(nature);
+    const avMatch = /^\/av\/([^/]+)(?:\/.*)?$/.exec(normalizedPath);
+    if (avMatch && avMatch[1]) {
+      const nature = decodeURIComponent(avMatch[1]);
+      const av = this.serviceDiscovery.resoudreAv(nature);
       if (!av) {
-        const err: ErreurApi = {
-          code: 'NATURE_NON_SUPPORTEE',
-          message: `La nature '${nature}' n'est pas supportée ou aucune Autorité de Validation n'est enregistrée pour cette nature.`,
-          horodatage: new Date().toISOString(),
-          chemin: req.path,
-        };
-        return {
-          status: 404,
-          headers: { 'Content-Type': 'application/json' },
-          body: err,
-        };
+        return buildRestError(
+          404,
+          'NATURE_INTROUVABLE',
+          `Aucune Autorité de Validation enregistrée pour la nature "${nature}".`,
+          req.path,
+          nowIso
+        );
       }
-      return av.handleRequest(req);
+      return av.handleRestRequest(req);
     }
 
-    // 5. Routing: /annuaire/...
-    if (cleanPath === '/annuaire' || cleanPath.startsWith('/annuaire/')) {
-      const annuaire = this.discovery.getAnnuaire();
+    if (normalizedPath === '/annuaire' || normalizedPath.startsWith('/annuaire/')) {
+      const annuaire = this.serviceDiscovery.resoudreAnnuaire();
       if (!annuaire) {
-        const err: ErreurApi = {
-          code: 'SERVICE_INDISPONIBLE',
-          message: "Le Service de Publication (Annuaire) n'est pas disponible.",
-          horodatage: new Date().toISOString(),
-          chemin: req.path,
-        };
-        return {
-          status: 503,
-          headers: { 'Content-Type': 'application/json' },
-          body: err,
-        };
+        return buildRestError(
+          503,
+          'SERVICE_INDISPONIBLE',
+          'Aucun Service de Publication enregistré dans le Service Discovery.',
+          req.path,
+          nowIso
+        );
       }
-      const response = annuaire.handleRequest(req);
-      if (response.status === 200 && req.method === 'GET' && this.isCacheablePath(cleanPath)) {
-        this.edgeCache.set(cleanPath, {
-          body: response.body,
-          status: response.status,
-          expiresAt: Date.now() + this.cacheTtlMs,
-        });
-      }
-      return response;
+      return annuaire.handleRestRequest(req);
     }
 
-    // 6. Routing: /config/...
-    if (cleanPath === '/config' || cleanPath.startsWith('/config/')) {
-      if (!this.configServer) {
-        const err: ErreurApi = {
-          code: 'SERVICE_INDISPONIBLE',
-          message: "Le Configuration Server n'est pas configuré sur l'API Gateway.",
-          horodatage: new Date().toISOString(),
-          chemin: req.path,
-        };
-        return {
-          status: 503,
-          headers: { 'Content-Type': 'application/json' },
-          body: err,
-        };
+    if (normalizedPath === '/config' || normalizedPath.startsWith('/config/')) {
+      if (!this.configurationServer) {
+        return buildRestError(
+          404,
+          'ROUTE_INTROUVABLE',
+          'Aucun Configuration Server configuré sur cette API Gateway.',
+          req.path,
+          nowIso
+        );
       }
-      return this.configServer.handleRequest(req);
+      return this.configurationServer.handleRestRequest(req);
     }
 
-    // 7. Fallback: 404 Not Found
-    const notFound: ErreurApi = {
-      code: 'RESSOURCE_INTROUVABLE',
-      message: `Ressource introuvable : ${req.method} ${cleanPath}`,
-      horodatage: new Date().toISOString(),
-      chemin: req.path,
-    };
-    return {
-      status: 404,
-      headers: { 'Content-Type': 'application/json' },
-      body: notFound,
-    };
-  }
-
-  private isSensitiveEndpoint(method: string, path: string): boolean {
-    if (method !== 'POST') return false;
-    return (
-      /^\/ae\/[^/]+\/demandes-certification$/.test(path) ||
-      /^\/ae\/[^/]+\/demandes-revocation$/.test(path)
-    );
-  }
-
-  private isCacheablePath(path: string): boolean {
-    return (
-      /^\/annuaire\/certificats\/[^/]+\/chemin-certification$/.test(path) ||
-      path === '/config/racine'
+    return buildRestError(
+      404,
+      'ROUTE_INTROUVABLE',
+      `Ressource REST introuvable sur l’API Gateway : "${req.path}".`,
+      req.path,
+      nowIso
     );
   }
 }

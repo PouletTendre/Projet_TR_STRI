@@ -1,4 +1,16 @@
-import crypto from 'node:crypto';
+import {
+  constants,
+  createCipheriv,
+  createDecipheriv,
+  createSign,
+  createVerify,
+  generateKeyPairSync,
+  privateDecrypt,
+  publicEncrypt,
+  randomBytes,
+  scryptSync,
+  timingSafeEqual
+} from 'node:crypto';
 import type { Certificat, ListeCertificatsRevoques } from '../types/index.js';
 
 export interface RsaKeyPair {
@@ -7,295 +19,305 @@ export interface RsaKeyPair {
   publicKeyBase64: string;
 }
 
-export function pemToBase64(pem: string): string {
-  return pem
-    .replace(/-----BEGIN [A-Z\s]+-----/g, '')
-    .replace(/-----END [A-Z\s]+-----/g, '')
-    .replace(/\s+/g, '');
+interface HybridEncryptedEnvelope {
+  alg: 'RSA-OAEP-256+AES-256-GCM';
+  encryptedKey: string;
+  iv: string;
+  authTag: string;
+  ciphertext: string;
 }
 
-export function base64ToPublicKeyPem(b64OrPem: string): string {
-  if (b64OrPem.includes('BEGIN PUBLIC KEY')) {
-    return b64OrPem;
-  }
-  const cleanB64 = b64OrPem.replace(/\s+/g, '');
-  const lines = cleanB64.match(/.{1,64}/g) || [];
-  return `-----BEGIN PUBLIC KEY-----\n${lines.join('\n')}\n-----END PUBLIC KEY-----\n`;
-}
+const PEM_PUBLIC_HEADER = '-----BEGIN PUBLIC KEY-----';
+const PEM_PUBLIC_FOOTER = '-----END PUBLIC KEY-----';
 
-export function generateRsaKeyPair(modulusLength = 2048): RsaKeyPair {
-  const { publicKey, privateKey } = crypto.generateKeyPairSync('rsa', {
-    modulusLength,
+/**
+ * Génère une Biclé RSA-2048 au format PEM (SPKI / PKCS8) et sa représentation Base64.
+ */
+export function generateRsaKeyPair(): RsaKeyPair {
+  const { publicKey, privateKey } = generateKeyPairSync('rsa', {
+    modulusLength: 2048,
     publicKeyEncoding: {
       type: 'spki',
-      format: 'pem',
+      format: 'pem'
     },
     privateKeyEncoding: {
       type: 'pkcs8',
-      format: 'pem',
-    },
+      format: 'pem'
+    }
   });
 
   return {
     publicKeyPem: publicKey,
     privateKeyPem: privateKey,
-    publicKeyBase64: pemToBase64(publicKey),
+    publicKeyBase64: publicKeyPemToBase64(publicKey)
   };
 }
 
-export function serializeCertificatDataToSign(
-  certData: Omit<Certificat, 'signatureAc'>
-): Buffer {
-  const normalized = {
-    algorithmeSignature: certData.algorithmeSignature ?? 'SHA256withRSA',
-    clePublique: pemToBase64(certData.clePublique),
-    dateDebutValidite: certData.dateDebutValidite,
-    dateFinValidite: certData.dateFinValidite,
-    identifiantAcEmettrice: certData.identifiantAcEmettrice,
-    natureRessource: certData.natureRessource ?? null,
-    niveauAcEmettrice: certData.niveauAcEmettrice ?? null,
-    numeroSerie: certData.numeroSerie,
-    sujet: certData.sujet,
-    usage: certData.usage,
-  };
+/**
+ * Convertit une clé publique PEM SPKI en chaîne Base64 sans en-têtes ni retours à la ligne.
+ */
+export function publicKeyPemToBase64(pem: string): string {
+  return pem
+    .replace(/-----BEGIN [^-]+-----/g, '')
+    .replace(/-----END [^-]+-----/g, '')
+    .replace(/\s+/g, '');
+}
 
-  const keys = Object.keys(normalized).sort() as (keyof typeof normalized)[];
-  const sortedObj: Record<string, unknown> = {};
-  for (const k of keys) {
-    sortedObj[k] = normalized[k];
+/**
+ * Convertit une clé publique encodée en Base64 SPKI vers le format PEM standard.
+ */
+export function publicKeyBase64ToPem(base64: string): string {
+  const clean = publicKeyPemToBase64(base64);
+  const lines = clean.match(/.{1,64}/g) ?? [];
+  return `${PEM_PUBLIC_HEADER}\n${lines.join('\n')}\n${PEM_PUBLIC_FOOTER}\n`;
+}
+
+function normalizePublicKeyToPem(publicKeyPemOrBase64: string): string {
+  if (publicKeyPemOrBase64.includes('-----BEGIN')) {
+    return publicKeyPemOrBase64;
   }
-
-  return Buffer.from(JSON.stringify(sortedObj), 'utf-8');
+  return publicKeyBase64ToPem(publicKeyPemOrBase64);
 }
 
-export function signCertificat(
-  certData: Omit<Certificat, 'signatureAc'>,
-  signerPrivateKeyPem: string
-): Certificat {
-  const dataToSign = serializeCertificatDataToSign(certData);
-  const signer = crypto.createSign('SHA256');
-  signer.update(dataToSign);
-  signer.end();
-  const signatureBase64 = signer.sign(signerPrivateKeyPem, 'base64');
-
-  return {
-    ...certData,
-    clePublique: pemToBase64(certData.clePublique),
-    algorithmeSignature: certData.algorithmeSignature ?? 'SHA256withRSA',
-    signatureAc: signatureBase64,
-  };
-}
-
-export function verifyCertificatSignature(
-  cert: Certificat,
-  signerPublicKeyPemOrBase64: string
-): boolean {
-  try {
-    const publicKeyPem = base64ToPublicKeyPem(signerPublicKeyPemOrBase64);
-    const dataToVerify = serializeCertificatDataToSign(cert);
-    const verifier = crypto.createVerify('SHA256');
-    verifier.update(dataToVerify);
-    verifier.end();
-    return verifier.verify(publicKeyPem, cert.signatureAc, 'base64');
-  } catch {
-    return false;
+/**
+ * Sérialise une valeur JSON de manière canonique (clés triées récursivement).
+ */
+export function canonicalJson(value: unknown): string {
+  if (value === null || typeof value !== 'object') {
+    return JSON.stringify(value);
   }
-}
-
-export function serializeLcrDataToSign(
-  lcrData: Omit<ListeCertificatsRevoques, 'signatureAc'>
-): Buffer {
-  const normalized = {
-    dateEmission: lcrData.dateEmission,
-    entrees: (lcrData.entrees ?? []).map((e) => ({
-      dateInvalidation: e.dateInvalidation,
-      motif: e.motif,
-      numeroSerieCertificat: e.numeroSerieCertificat,
-      statut: e.statut,
-    })).sort((a, b) => a.numeroSerieCertificat.localeCompare(b.numeroSerieCertificat)),
-    identifiantAc: lcrData.identifiantAc,
-    numeroVersionLcr: lcrData.numeroVersionLcr,
-    prochaineMiseAJour: lcrData.prochaineMiseAJour,
-  };
-
-  return Buffer.from(JSON.stringify(normalized), 'utf-8');
-}
-
-export function signLcr(
-  lcrData: Omit<ListeCertificatsRevoques, 'signatureAc'>,
-  signerPrivateKeyPem: string
-): ListeCertificatsRevoques {
-  const dataToSign = serializeLcrDataToSign(lcrData);
-  const signer = crypto.createSign('SHA256');
-  signer.update(dataToSign);
-  signer.end();
-  const signatureBase64 = signer.sign(signerPrivateKeyPem, 'base64');
-
-  return {
-    ...lcrData,
-    signatureAc: signatureBase64,
-  };
-}
-
-export function verifyLcrSignature(
-  lcr: ListeCertificatsRevoques,
-  signerPublicKeyPemOrBase64: string
-): boolean {
-  try {
-    const publicKeyPem = base64ToPublicKeyPem(signerPublicKeyPemOrBase64);
-    const dataToVerify = serializeLcrDataToSign(lcr);
-    const verifier = crypto.createVerify('SHA256');
-    verifier.update(dataToVerify);
-    verifier.end();
-    return verifier.verify(publicKeyPem, lcr.signatureAc, 'base64');
-  } catch {
-    return false;
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => canonicalJson(item)).join(',')}]`;
   }
-}
-
-export function base64ToPrivateKeyPem(b64OrPem: string): string {
-  if (
-    b64OrPem.includes('BEGIN PRIVATE KEY') ||
-    b64OrPem.includes('BEGIN RSA PRIVATE KEY')
-  ) {
-    return b64OrPem;
-  }
-  const cleanB64 = b64OrPem.replace(/\s+/g, '');
-  const lines = cleanB64.match(/.{1,64}/g) || [];
-  return `-----BEGIN PRIVATE KEY-----\n${lines.join('\n')}\n-----END PRIVATE KEY-----\n`;
-}
-
-export interface ChatMessageDataToSign {
-  echangeId: string;
-  numeroSequence: number;
-  horodatage: string;
-  texte: string;
-}
-
-export function serializeChatMessageData(data: ChatMessageDataToSign): Buffer {
-  return Buffer.from(
-    `${data.echangeId}|${data.numeroSequence}|${data.horodatage}|${data.texte}`,
-    'utf-8'
+  const record = value as Record<string, unknown>;
+  const sortedKeys = Object.keys(record)
+    .filter((k) => record[k] !== undefined)
+    .sort();
+  const entries = sortedKeys.map(
+    (key) => `${JSON.stringify(key)}:${canonicalJson(record[key])}`
   );
+  return `{${entries.join(',')}}`;
 }
 
-export function signChatMessage(
-  data: ChatMessageDataToSign,
-  privateKeyPemOrBase64: string
-): string {
-  const privateKeyPem = base64ToPrivateKeyPem(privateKeyPemOrBase64);
-  const dataToSign = serializeChatMessageData(data);
-  const signer = crypto.createSign('SHA256');
-  signer.update(dataToSign);
+function signCanonicalPayload(payload: unknown, privateKeyPem: string): string {
+  const signer = createSign('RSA-SHA256');
+  signer.update(canonicalJson(payload), 'utf8');
   signer.end();
   return signer.sign(privateKeyPem, 'base64');
 }
 
-export function verifyChatMessageSignature(
-  data: ChatMessageDataToSign,
+function verifyCanonicalPayload(
+  payload: unknown,
   signatureBase64: string,
   publicKeyPemOrBase64: string
 ): boolean {
   try {
-    const pem = base64ToPublicKeyPem(publicKeyPemOrBase64);
-    const dataToVerify = serializeChatMessageData(data);
-    const verifier = crypto.createVerify('SHA256');
-    verifier.update(dataToVerify);
+    const verifier = createVerify('RSA-SHA256');
+    verifier.update(canonicalJson(payload), 'utf8');
     verifier.end();
-    return verifier.verify(pem, signatureBase64, 'base64');
+    return verifier.verify(
+      normalizePublicKeyToPem(publicKeyPemOrBase64),
+      signatureBase64,
+      'base64'
+    );
   } catch {
     return false;
   }
 }
 
-export interface EncryptedPayload {
-  contenuTexte: string;
-  cleSessionChiffreeCpDestinataire: string;
-  iv: string;
-  tag: string;
-  algorithmeChiffrement: string;
+/**
+ * Signe un Certificat en SHA256withRSA sur sa représentation JSON canonique.
+ */
+export function signCertificat(
+  certSansSignature: Omit<Certificat, 'signatureAc'>,
+  privateKeyPem: string
+): Certificat {
+  const signatureAc = signCanonicalPayload(certSansSignature, privateKeyPem);
+  return {
+    ...certSansSignature,
+    signatureAc
+  };
 }
 
-export function encryptChatMessage(
-  texte: string,
-  recipientPublicKeyPemOrBase64: string
-): EncryptedPayload {
-  const recipientPem = base64ToPublicKeyPem(recipientPublicKeyPemOrBase64);
-  const aesKey = crypto.randomBytes(32); // AES-256
-  const iv = crypto.randomBytes(12); // GCM 96-bit IV
+/**
+ * Vérifie la signature SHA256withRSA d'un Certificat à l'aide de la clé publique de l'AC émettrice.
+ */
+export function verifyCertificatSignature(
+  certificat: Certificat,
+  acPublicKeyPemOrBase64: string
+): boolean {
+  const { signatureAc, ...payloadSansSignature } = certificat;
+  if (!signatureAc) {
+    return false;
+  }
+  return verifyCanonicalPayload(
+    payloadSansSignature,
+    signatureAc,
+    acPublicKeyPemOrBase64
+  );
+}
 
-  const cipher = crypto.createCipheriv('aes-256-gcm', aesKey, iv);
-  const ciphertextBuffer = Buffer.concat([
-    cipher.update(texte, 'utf-8'),
-    cipher.final(),
+/**
+ * Signe une Liste des Certificats Révoqués (LCR) en SHA256withRSA.
+ */
+export function signLcr(
+  lcrSansSignature: Omit<ListeCertificatsRevoques, 'signatureAc'>,
+  privateKeyPem: string
+): ListeCertificatsRevoques {
+  const signatureAc = signCanonicalPayload(lcrSansSignature, privateKeyPem);
+  return {
+    ...lcrSansSignature,
+    signatureAc
+  };
+}
+
+/**
+ * Vérifie la signature SHA256withRSA d'une LCR à l'aide de la clé publique de l'AC émettrice.
+ */
+export function verifyLcrSignature(
+  lcr: ListeCertificatsRevoques,
+  acPublicKeyPemOrBase64: string
+): boolean {
+  const { signatureAc, ...payloadSansSignature } = lcr;
+  if (!signatureAc) {
+    return false;
+  }
+  return verifyCanonicalPayload(
+    payloadSansSignature,
+    signatureAc,
+    acPublicKeyPemOrBase64
+  );
+}
+
+/**
+ * Hache un mot de passe avec un sel aléatoire (16 octets) et scrypt.
+ */
+export function hashPassword(password: string): string {
+  const salt = randomBytes(16).toString('hex');
+  const derived = scryptSync(password, salt, 64).toString('hex');
+  return `${salt}:${derived}`;
+}
+
+/**
+ * Vérifie un mot de passe face à un condensat scrypt en temps constant (timingSafeEqual).
+ */
+export function verifyPassword(password: string, storedHash: string): boolean {
+  const parts = storedHash.split(':');
+  if (parts.length !== 2) {
+    return false;
+  }
+  const [salt, expectedHex] = parts;
+  if (!salt || !expectedHex) {
+    return false;
+  }
+  const expectedBuf = Buffer.from(expectedHex, 'hex');
+  const actualBuf = scryptSync(password, salt, 64);
+  if (expectedBuf.length !== actualBuf.length) {
+    return false;
+  }
+  return timingSafeEqual(expectedBuf, actualBuf);
+}
+
+/**
+ * Signe un message texte de messagerie sécurisée avec RSA-SHA256.
+ */
+export function signMessageText(plaintext: string, privateKeyPem: string): string {
+  const signer = createSign('RSA-SHA256');
+  signer.update(plaintext, 'utf8');
+  signer.end();
+  return signer.sign(privateKeyPem, 'base64');
+}
+
+/**
+ * Vérifie la signature RSA-SHA256 d'un message texte de messagerie sécurisée.
+ */
+export function verifyMessageSignature(
+  plaintext: string,
+  signatureBase64: string,
+  publicKeyPemOrBase64: string
+): boolean {
+  try {
+    const verifier = createVerify('RSA-SHA256');
+    verifier.update(plaintext, 'utf8');
+    verifier.end();
+    return verifier.verify(
+      normalizePublicKeyToPem(publicKeyPemOrBase64),
+      signatureBase64,
+      'base64'
+    );
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Chiffre un message texte par chiffrement hybride RSA-OAEP-256 + AES-256-GCM.
+ */
+export function encryptHybridMessage(
+  plaintext: string,
+  recipientPublicKeyPemOrBase64: string
+): string {
+  const aesKey = randomBytes(32);
+  const iv = randomBytes(12);
+  const cipher = createCipheriv('aes-256-gcm', aesKey, iv);
+  const ciphertext = Buffer.concat([
+    cipher.update(plaintext, 'utf8'),
+    cipher.final()
   ]);
   const authTag = cipher.getAuthTag();
 
-  const encryptedSessionKey = crypto.publicEncrypt(
+  const encryptedKey = publicEncrypt(
     {
-      key: recipientPem,
-      padding: crypto.constants.RSA_PKCS1_OAEP_PADDING,
-      oaepHash: 'sha256',
+      key: normalizePublicKeyToPem(recipientPublicKeyPemOrBase64),
+      padding: constants.RSA_PKCS1_OAEP_PADDING,
+      oaepHash: 'sha256'
     },
     aesKey
   );
 
-  return {
-    contenuTexte: ciphertextBuffer.toString('base64'),
-    cleSessionChiffreeCpDestinataire: encryptedSessionKey.toString('base64'),
+  const envelope: HybridEncryptedEnvelope = {
+    alg: 'RSA-OAEP-256+AES-256-GCM',
+    encryptedKey: encryptedKey.toString('base64'),
     iv: iv.toString('base64'),
-    tag: authTag.toString('base64'),
-    algorithmeChiffrement: 'RSA-OAEP-256+AES-256-GCM',
+    authTag: authTag.toString('base64'),
+    ciphertext: ciphertext.toString('base64')
   };
+
+  return JSON.stringify(envelope);
 }
 
-export function decryptChatMessage(
-  payload: {
-    contenuTexte: string;
-    cleSessionChiffreeCpDestinataire?: string | null;
-    iv?: string | null;
-    tag?: string | null;
-  },
-  recipientPrivateKeyPemOrBase64: string
+/**
+ * Déchiffre une enveloppe hybride RSA-OAEP-256 + AES-256-GCM avec la clé privée du Correspondant récepteur.
+ */
+export function decryptHybridMessage(
+  encryptedJson: string,
+  recipientPrivateKeyPem: string
 ): string {
-  const privateKeyPem = base64ToPrivateKeyPem(recipientPrivateKeyPemOrBase64);
-
-  // Hybrid AES-256-GCM + RSA-OAEP
-  if (payload.cleSessionChiffreeCpDestinataire && payload.iv) {
-    const aesKey = crypto.privateDecrypt(
-      {
-        key: privateKeyPem,
-        padding: crypto.constants.RSA_PKCS1_OAEP_PADDING,
-        oaepHash: 'sha256',
-      },
-      Buffer.from(payload.cleSessionChiffreeCpDestinataire, 'base64')
-    );
-
-    const decipher = crypto.createDecipheriv(
-      'aes-256-gcm',
-      aesKey,
-      Buffer.from(payload.iv, 'base64')
-    );
-    if (payload.tag) {
-      decipher.setAuthTag(Buffer.from(payload.tag, 'base64'));
-    }
-
-    const decrypted = Buffer.concat([
-      decipher.update(Buffer.from(payload.contenuTexte, 'base64')),
-      decipher.final(),
-    ]);
-
-    return decrypted.toString('utf-8');
+  const envelope = JSON.parse(encryptedJson) as HybridEncryptedEnvelope;
+  if (envelope.alg !== 'RSA-OAEP-256+AES-256-GCM') {
+    throw new Error(`Algorithme de chiffrement hybride non supporté: ${String(envelope.alg)}`);
   }
 
-  // Pure RSA-OAEP fallback
-  const decrypted = crypto.privateDecrypt(
+  const aesKey = privateDecrypt(
     {
-      key: privateKeyPem,
-      padding: crypto.constants.RSA_PKCS1_OAEP_PADDING,
-      oaepHash: 'sha256',
+      key: recipientPrivateKeyPem,
+      padding: constants.RSA_PKCS1_OAEP_PADDING,
+      oaepHash: 'sha256'
     },
-    Buffer.from(payload.contenuTexte, 'base64')
+    Buffer.from(envelope.encryptedKey, 'base64')
   );
-  return decrypted.toString('utf-8');
+
+  const decipher = createDecipheriv(
+    'aes-256-gcm',
+    aesKey,
+    Buffer.from(envelope.iv, 'base64')
+  );
+  decipher.setAuthTag(Buffer.from(envelope.authTag, 'base64'));
+
+  const plaintext = Buffer.concat([
+    decipher.update(Buffer.from(envelope.ciphertext, 'base64')),
+    decipher.final()
+  ]);
+
+  return plaintext.toString('utf8');
 }

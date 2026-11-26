@@ -1,72 +1,153 @@
-import type { InMemoryJmsBroker } from '../broker/index.js';
-import type { ServicePublication } from '../annuaire/index.js';
 import type {
-  AutoriteValidation,
-  ServiceAutoriteValidation,
-} from '../av/index.js';
+  Certificat,
+  NatureRessource,
+  NiveauSecurite
+} from '../types/index.js';
+import type { UtilisateurIcpClient } from '../client/utilisateur-icp.js';
 
-export type NiveauSecurite =
-  | 'NON_SECURISE'
-  | 'SIGNE'
-  | 'CHIFFRE'
-  | 'SIGNE_ET_CHIFFRE';
+export type { NiveauSecurite };
 
 export type TypeMessageChat = 'INIT_ECHANGE' | 'MSG_TEXTE' | 'FIN_MSG';
 
-export type EtatEchange = 'ACTIF' | 'TERMINE';
+export type StatutSessionEchange = 'ACTIVE' | 'FERMEE';
 
-export interface MessageChat {
+export interface AmqpChatHeaders {
+  echange_id: string;
+  type_message: TypeMessageChat;
+  niveau_securite: NiveauSecurite;
+  emetteur_id: string;
+  correspondant_recepteur_id?: string;
+  numero_sequence?: number;
+  [key: string]: unknown;
+}
+
+export interface ProprietesMessageChatAmqp {
+  content_type: 'application/json';
+  delivery_mode: 2;
+  correlation_id: string;
+  type: TypeMessageChat;
+  message_id: string;
+  timestamp: string;
+  headers: AmqpChatHeaders;
+}
+
+export type ProprietesPublicationChatAmqp = Partial<
+  Omit<ProprietesMessageChatAmqp, 'correlation_id' | 'type' | 'headers'>
+> & {
+  correlation_id: string;
+  type: TypeMessageChat;
+  headers: AmqpChatHeaders;
+};
+
+export interface MessageChatPayload {
   echangeId: string;
   numeroSequence: number;
   typeMessage: TypeMessageChat;
   niveauSecurite: NiveauSecurite;
-  expediteurId: string;
-  destinataireId: string;
-  texte: string;
+  emetteurId: string;
+  correspondantRecepteurId: string;
   horodatage: string;
-  numeroSerieCertExpediteur?: string | null;
-  numeroSerieCertDestinataire?: string | null;
-  signature?: string | null;
+  contenu?: string;
+  signature?: string;
+  contenuChiffre?: string;
+  numeroSerieCertificatSignature?: string;
+  numeroSerieCertificatChiffrement?: string;
 }
 
-export interface EchangeSession {
+export interface EnveloppeChatAmqp {
+  exchange: string;
+  routingKey: string;
+  payload: MessageChatPayload;
+  rawBody: string;
+  properties: ProprietesMessageChatAmqp;
+}
+
+export type ChatMessageHandler = (
+  enveloppe: EnveloppeChatAmqp
+) => void | Promise<void>;
+
+export interface ChatAmqpTransport {
+  publierMessageChat(
+    correspondantRecepteurId: string,
+    payload: MessageChatPayload,
+    proprietes: ProprietesPublicationChatAmqp
+  ): Promise<void>;
+  abonnerBoiteReception(
+    correspondantId: string,
+    handler: ChatMessageHandler
+  ): Promise<string>;
+  desabonnerBoiteReception?(
+    correspondantId: string,
+    consumerTag: string
+  ): boolean;
+}
+
+export interface SessionEchangeState {
   echangeId: string;
-  interlocuteurId: string;
-  expediteurInitialId: string;
+  correspondantDistantId: string;
   niveauSecurite: NiveauSecurite;
-  etat: EtatEchange;
-  dernierNumeroSequence: number;
-  dateCreation: string;
-  dateCloture?: string;
-  messages: MessageChat[];
-  interlocuteurCertificatNumeroSerie?: string | null;
-  interlocuteurCertificatChiffrementNumeroSerie?: string | null;
+  statut: StatutSessionEchange;
+  initiateurId: string;
+  dernierNumeroSequenceEnvoye: number;
+  dernierNumeroSequenceRecu: number;
+  sequencesRecuesParEmetteur: Record<string, number>;
+  certificatDistantSignatureNumeroSerie?: string;
+  certificatDistantChiffrementNumeroSerie?: string;
+  horodatageOuverture: string;
+  horodatageCloture?: string;
 }
 
-export interface InitialiserEchangeOptions {
-  niveauSecurite?: NiveauSecurite;
-  premierMessage?: string;
-  echangeId?: string;
-  destinataireCertificatNumeroSerie?: string;
-  destinataireCertificatChiffrementNumeroSerie?: string;
+export interface MessageEnvoye {
+  echangeId: string;
+  numeroSequence: number;
+  typeMessage: TypeMessageChat;
+  niveauSecurite: NiveauSecurite;
+  emetteurId: string;
+  correspondantRecepteurId: string;
+  horodatage: string;
+  sessionFermee: boolean;
 }
 
-export interface EnvoyerMessageOptions {
-  numeroSequence?: number;
-  niveauSecurite?: NiveauSecurite;
-  typeMessage?: TypeMessageChat;
+export interface MessageRecu {
+  echangeId: string;
+  numeroSequence: number;
+  typeMessage: TypeMessageChat;
+  niveauSecurite: NiveauSecurite;
+  emetteurId: string;
+  correspondantRecepteurId: string;
+  contenu: string;
+  horodatage: string;
+  sessionFermee: boolean;
 }
 
-export type MessageChatListener = (message: MessageChat) => void;
+export interface ErreurReceptionChat {
+  erreur: Error;
+  enveloppe: EnveloppeChatAmqp;
+  horodatage: string;
+}
 
 export interface CorrespondantClientConfig {
-  id: string;
-  broker: InMemoryJmsBroker;
-  certificatNumeroSerie?: string;
-  clePriveePem?: string;
-  clePubliquePem?: string;
-  certificatChiffrementNumeroSerie?: string;
-  clePriveeChiffrementPem?: string;
-  annuaire?: ServicePublication;
-  av?: AutoriteValidation | ServiceAutoriteValidation;
+  correspondantId: string;
+  natureRessource?: NatureRessource;
+  transport: ChatAmqpTransport;
+  utilisateurIcp: UtilisateurIcpClient;
+  certificat?: Certificat;
+  clePrivee?: string;
+  certificatSignature?: Certificat;
+  clePriveeSignature?: string;
+  certificatChiffrement?: Certificat;
+  clePriveeChiffrement?: string;
+  horloge?: () => Date;
+  autoAbonnement?: boolean;
+}
+
+export interface OptionsOuvertureEchange {
+  echangeId?: string;
+  numeroSerieCertificatCorrespondantRecepteur?: string;
+  numeroSerieCertificatSignatureCorrespondantRecepteur?: string;
+  numeroSerieCertificatChiffrementCorrespondantRecepteur?: string;
+}
+
+export interface OptionsEnvoiMessage {
+  niveauSecurite?: NiveauSecurite;
 }
