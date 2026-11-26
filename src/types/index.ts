@@ -141,3 +141,72 @@ export interface AmqpMessage<TPayload = unknown> {
 export type AmqpConsumerHandler<TPayload = unknown> = (
   message: AmqpMessage<TPayload>
 ) => void | Promise<void>;
+
+export interface DroitsEntiteAE {
+  nomEntite: string;
+  natureRessource?: string;
+  droitSignature: boolean;
+  droitChiffrement: boolean;
+  droitDemandeRevocation: boolean;
+  acRattachementId: string;
+}
+
+export interface EntiteAEInscription {
+  nomEntite: string;
+  motDePasse: string;
+  droitSignature: boolean;
+  droitChiffrement: boolean;
+  droitDemandeRevocation: boolean;
+  acRattachementId: string;
+}
+
+export interface EntiteAERegistre {
+  nomEntite: string;
+  natureRessource: NatureRessource;
+  motDePasseHash: string;
+  droitSignature: boolean;
+  droitChiffrement: boolean;
+  droitDemandeRevocation: boolean;
+  acRattachementId: string;
+}
+
+export type StatutDemandeCertification = 'EN_ATTENTE_AC' | 'EMISE' | 'REJETEE';
+
+export interface DemandeCertificationRequete {
+  nomEntite: string;
+  motDePasse: string;
+  acCibleId?: string;
+  usage: UsageCle;
+  clePublique?: string;
+  genererBicle?: boolean;
+}
+
+export interface DemandeCertificationReponse {
+  demandeId: string;
+  statutDemande: StatutDemandeCertification;
+  horodatage: string;
+  certificat?: Certificat;
+  clePriveeGeneree?: string | null;
+}
+
+export interface CommandeDemandeCertificationPayload {
+  demandeId: string;
+  sujet: string;
+  natureRessource: NatureRessource;
+  acCibleId: string;
+  usage: UsageCle;
+  clePublique?: string;
+  genererBicle: boolean;
+  dureeValiditeJours?: number;
+}
+
+export interface ReponseDemandeCertificationPayload {
+  demandeId: string;
+  statut: 'EMISE' | 'REJETEE';
+  certificat?: Certificat;
+  clePriveeGeneree?: string | null;
+  erreur?: {
+    code: string;
+    message: string;
+  };
+}

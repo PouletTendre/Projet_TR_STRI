@@ -1,22 +1,34 @@
 import { AMQP_EXCHANGES, InMemoryAmqpBroker } from '../amqp/index.js';
 import {
   generateRsaKeyPair,
+  publicKeyPemToBase64,
   signCertificat,
   signLcr,
   type RsaKeyPair
 } from '../crypto/index.js';
 import type {
+  AmqpMessage,
   AutoriteCertificationInfo,
   Certificat,
+  CommandeDemandeCertificationPayload,
   EntreeLcr,
   ListeCertificatsRevoques,
   PublicationCertificatPayload,
-  PublicationLcrPayload
+  PublicationLcrPayload,
+  ReponseDemandeCertificationPayload
 } from '../types/index.js';
 
 export interface OptionsValiditeAc {
   dateDebut?: Date;
   dureeValiditeJours?: number;
+}
+
+export function queueAcDemandes(acId: string): string {
+  return `q.pki.ac.${acId}.demandes`;
+}
+
+export function routingKeyAc(acId: string): string {
+  return `ac.${acId}`;
 }
 
 export interface HierarchieAc {
@@ -92,6 +104,7 @@ export class AutoriteCertification {
   private numeroVersionLcr = 0;
   private readonly entreesLcr = new Map<string, EntreeLcr>();
   private lcrCourante: ListeCertificatsRevoques;
+  private commandeConsumerTag: string | null = null;
 
   constructor(config: AutoriteCertificationConfig) {
     this.acId = config.acId;
@@ -195,6 +208,51 @@ export class AutoriteCertification {
     this.certificatAc = certificat;
   }
 
+  declarerFileCommandes(): void {
+    if (this.niveau !== 3) {
+      throw new Error(`Seule une AC de niveau 3 peut déclarer une file de demandes (${this.acId}).`);
+    }
+    this.broker.declareExchange(AMQP_EXCHANGES.COMMANDES, 'direct', { durable: true });
+    this.broker.declareQueue(queueAcDemandes(this.acId), { durable: true });
+    this.broker.bindQueue(
+      queueAcDemandes(this.acId),
+      AMQP_EXCHANGES.COMMANDES,
+      routingKeyAc(this.acId)
+    );
+  }
+
+  /**
+   * Démarre ou reprend la consommation de la file AMQP `q.pki.ac.<id_ac>.demandes`.
+   */
+  async reprendreConsommation(): Promise<void> {
+    if (this.niveau !== 3) {
+      throw new Error(`Seule une AC de niveau 3 peut consommer des commandes (${this.acId}).`);
+    }
+    this.declarerFileCommandes();
+    if (this.commandeConsumerTag !== null) {
+      return;
+    }
+    this.commandeConsumerTag = await this.broker.consume(
+      queueAcDemandes(this.acId),
+      async (message) => {
+        await this.traiterCommandeAmqp(message);
+      }
+    );
+  }
+
+  /**
+   * Suspend temporairement la consommation des commandes AMQP (laisse les messages en file FIFO).
+   */
+  suspendreConsommation(): void {
+    if (this.niveau !== 3) {
+      throw new Error(`Seule une AC de niveau 3 peut suspendre sa consommation (${this.acId}).`);
+    }
+    if (this.commandeConsumerTag !== null) {
+      this.broker.unsubscribe(queueAcDemandes(this.acId), this.commandeConsumerTag);
+      this.commandeConsumerTag = null;
+    }
+  }
+
   protected async publierCertificat(
     certificat: Certificat,
     autoriteInfo?: AutoriteCertificationInfo
@@ -205,13 +263,141 @@ export class AutoriteCertification {
     };
     const routingKey = autoriteInfo
       ? `certificat.n${this.niveau}.ac`
-      : `certificat.n${this.niveau}.porteur`;
+      : `certificat.n${this.niveau}.${certificat.natureRessource ?? 'porteur'}`;
 
     await this.broker.publish(AMQP_EXCHANGES.PUBLICATIONS, routingKey, payload, {
       type: 'PUBLICATION_CERTIFICAT',
       headers: {
         acId: this.acId,
         niveau: this.niveau
+      }
+    });
+  }
+
+  private async traiterCommandeAmqp(message: AmqpMessage): Promise<void> {
+    if (message.properties.type !== 'DEMANDE_CERTIFICATION') {
+      return;
+    }
+
+    const payload = message.payload as Partial<CommandeDemandeCertificationPayload> | null;
+    const correlationId = message.properties.correlation_id ?? payload?.demandeId;
+    const replyTo = message.properties.reply_to;
+
+    if (!payload || !payload.demandeId || !payload.sujet || !payload.usage) {
+      await this.repondreRejet(
+        replyTo,
+        correlationId,
+        payload?.demandeId ?? correlationId,
+        'COMMANDE_INVALIDE',
+        'Commande DEMANDE_CERTIFICATION incomplète.'
+      );
+      return;
+    }
+
+    if (!this.certificatAc) {
+      await this.repondreRejet(
+        replyTo,
+        correlationId,
+        payload.demandeId,
+        'AC_NON_CERTIFIEE',
+        `L'AC "${this.acId}" n'est pas encore certifiée.`
+      );
+      return;
+    }
+
+    if (payload.usage === 'CERTIFICATION_AC') {
+      await this.repondreRejet(
+        replyTo,
+        correlationId,
+        payload.demandeId,
+        'USAGE_INTERDIT',
+        'Un Porteur ne peut pas obtenir un certificat CERTIFICATION_AC.'
+      );
+      return;
+    }
+
+    let clePubliqueBase64: string;
+    let clePriveeEphemeral: string | null = null;
+
+    if (payload.genererBicle) {
+      const bicle = generateRsaKeyPair();
+      clePubliqueBase64 = bicle.publicKeyBase64;
+      clePriveeEphemeral = bicle.privateKeyPem;
+    } else if (typeof payload.clePublique === 'string' && payload.clePublique.trim() !== '') {
+      clePubliqueBase64 = publicKeyPemToBase64(payload.clePublique);
+    } else {
+      await this.repondreRejet(
+        replyTo,
+        correlationId,
+        payload.demandeId,
+        'CLE_PUBLIQUE_MANQUANTE',
+        'Aucune clé publique fournie pour la demande.'
+      );
+      return;
+    }
+
+    const debut = new Date();
+    const dureeJours = payload.dureeValiditeJours ?? 365;
+    const fin = new Date(debut.getTime() + dureeJours * 24 * 60 * 60 * 1000);
+
+    const certificat = signCertificat(
+      {
+        numeroSerie: this.generateurNumeroSerie.generer(this.acId, debut.getUTCFullYear()),
+        identifiantAcEmettrice: this.acId,
+        niveauAcEmettrice: this.niveau,
+        dateDebutValidite: debut.toISOString(),
+        dateFinValidite: fin.toISOString(),
+        usage: payload.usage,
+        sujet: payload.sujet,
+        ...(payload.natureRessource ? { natureRessource: payload.natureRessource } : {}),
+        clePublique: clePubliqueBase64,
+        algorithmeSignature: 'SHA256withRSA'
+      },
+      this.keyPair.privateKeyPem
+    );
+
+    this.certificatsEmis.set(certificat.numeroSerie, certificat);
+
+    await this.publierCertificat(certificat);
+
+    if (replyTo && correlationId) {
+      await this.publierReponseCertification(replyTo, correlationId, {
+        demandeId: payload.demandeId,
+        statut: 'EMISE',
+        certificat,
+        clePriveeGeneree: clePriveeEphemeral
+      });
+    }
+  }
+
+  private async repondreRejet(
+    replyTo: string | undefined,
+    correlationId: string | undefined,
+    demandeId: string | undefined,
+    code: string,
+    message: string
+  ): Promise<void> {
+    if (!replyTo || !correlationId) {
+      return;
+    }
+    await this.publierReponseCertification(replyTo, correlationId, {
+      demandeId: demandeId ?? correlationId,
+      statut: 'REJETEE',
+      clePriveeGeneree: null,
+      erreur: { code, message }
+    });
+  }
+
+  private async publierReponseCertification(
+    replyTo: string,
+    correlationId: string,
+    payload: ReponseDemandeCertificationPayload
+  ): Promise<void> {
+    await this.broker.publish(AMQP_EXCHANGES.COMMANDES, replyTo, payload, {
+      type: 'REPONSE_CERTIFICATION',
+      correlation_id: correlationId,
+      headers: {
+        acId: this.acId
       }
     });
   }
@@ -330,6 +516,9 @@ export async function amorcerHierarchieAc(
   await infra.publierLcr();
   await dsiMessagerie.publierLcr();
   await infraReseau.publierLcr();
+
+  await dsiMessagerie.reprendreConsommation();
+  await infraReseau.reprendreConsommation();
 
   const autorites = new Map<string, AutoriteCertification>([
     [racine.acId, racine],
