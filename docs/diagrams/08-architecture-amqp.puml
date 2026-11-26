@@ -27,7 +27,7 @@ package "Consommateurs AMQP 0-9-1" {
   rectangle "AE (réception réponses)" as Cons_AE
   rectangle "Service de Publication" as Cons_Pub
   rectangle "AV (par nature)" as Cons_AV
-  rectangle "Correspondant destinataire" as Cons_Chat
+  rectangle "Correspondant récepteur" as Cons_Chat
 }
 
 Prod_AE --> Ex_Cmd : clé: ac.<id_ac>\n(reply_to: ae.<id_ae>, correlation_id)

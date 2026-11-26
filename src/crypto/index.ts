@@ -287,7 +287,7 @@ export function encryptHybridMessage(
 }
 
 /**
- * Déchiffre une enveloppe hybride RSA-OAEP-256 + AES-256-GCM avec la clé privée du destinataire.
+ * Déchiffre une enveloppe hybride RSA-OAEP-256 + AES-256-GCM avec la clé privée du Correspondant récepteur.
  */
 export function decryptHybridMessage(
   encryptedJson: string,

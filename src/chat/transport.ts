@@ -21,6 +21,48 @@ export function chatInboxQueue(correspondantId: string): string {
 }
 
 /**
+ * Normalise les propriétés AMQP 0-9-1 d'un message de messagerie sécurisée sortant.
+ */
+export function normaliserProprietesChat(
+  proprietes: ProprietesPublicationChatAmqp
+): ProprietesMessageChatAmqp {
+  return {
+    content_type: 'application/json',
+    delivery_mode: 2,
+    correlation_id: proprietes.correlation_id,
+    type: proprietes.type,
+    message_id: proprietes.message_id ?? randomUUID(),
+    timestamp: proprietes.timestamp ?? new Date().toISOString(),
+    headers: {
+      ...proprietes.headers
+    }
+  };
+}
+
+/**
+ * Convertit un message AMQP brut en enveloppe typée `EnveloppeChatAmqp`.
+ */
+export function convertirMessageAmqpEnEnveloppeChat(
+  msg: AmqpMessage<MessageChatPayload>
+): EnveloppeChatAmqp {
+  return {
+    exchange: msg.exchange,
+    routingKey: msg.routingKey,
+    payload: msg.payload,
+    rawBody: msg.rawBody,
+    properties: {
+      content_type: msg.properties.content_type as 'application/json',
+      delivery_mode: msg.properties.delivery_mode as 2,
+      correlation_id: msg.properties.correlation_id ?? '',
+      type: (msg.properties.type ?? msg.payload?.typeMessage) as ProprietesMessageChatAmqp['type'],
+      message_id: msg.properties.message_id,
+      timestamp: msg.properties.timestamp,
+      headers: (msg.properties.headers ?? {}) as ProprietesMessageChatAmqp['headers']
+    }
+  };
+}
+
+/**
  * Implémentation AMQP 0-9-1 du transport de messagerie texte sur `ex.chat.messages` (`direct`, durable),
  * avec routage `inbox.<id_correspondant>` vers la file durable `q.chat.inbox.<id_correspondant>`.
  */
@@ -33,22 +75,12 @@ export class DirectAmqpChatTransport implements ChatAmqpTransport {
   }
 
   async publierMessageChat(
-    destinataireId: string,
+    correspondantRecepteurId: string,
     payload: MessageChatPayload,
     proprietes: ProprietesPublicationChatAmqp
   ): Promise<void> {
-    const routingKey = chatRoutingKey(destinataireId);
-    const propsNormalisees: ProprietesMessageChatAmqp = {
-      content_type: 'application/json',
-      delivery_mode: 2,
-      correlation_id: proprietes.correlation_id,
-      type: proprietes.type,
-      message_id: proprietes.message_id ?? randomUUID(),
-      timestamp: proprietes.timestamp ?? new Date().toISOString(),
-      headers: {
-        ...proprietes.headers
-      }
-    };
+    const routingKey = chatRoutingKey(correspondantRecepteurId);
+    const propsNormalisees = normaliserProprietesChat(proprietes);
 
     await this.broker.publish(
       EXCHANGE_CHAT_MESSAGES,
@@ -71,22 +103,7 @@ export class DirectAmqpChatTransport implements ChatAmqpTransport {
     return this.broker.consume<MessageChatPayload>(
       queue,
       async (msg: AmqpMessage<MessageChatPayload>) => {
-        const enveloppe: EnveloppeChatAmqp = {
-          exchange: msg.exchange,
-          routingKey: msg.routingKey,
-          payload: msg.payload,
-          rawBody: msg.rawBody,
-          properties: {
-            content_type: msg.properties.content_type as 'application/json',
-            delivery_mode: msg.properties.delivery_mode as 2,
-            correlation_id: msg.properties.correlation_id ?? '',
-            type: (msg.properties.type ?? msg.payload?.typeMessage) as ProprietesMessageChatAmqp['type'],
-            message_id: msg.properties.message_id,
-            timestamp: msg.properties.timestamp,
-            headers: (msg.properties.headers ?? {}) as ProprietesMessageChatAmqp['headers']
-          }
-        };
-        await handler(enveloppe);
+        await handler(convertirMessageAmqpEnEnveloppeChat(msg));
       }
     );
   }

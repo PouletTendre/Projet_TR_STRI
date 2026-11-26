@@ -569,7 +569,7 @@ describe('Slice 3 — Modes CHIFFRE et SIGNE_ET_CHIFFRE (RSA-OAEP + AES-256-GCM)
         typeMessage: 'MSG_TEXTE',
         niveauSecurite: 'SIGNE_ET_CHIFFRE',
         emetteurId: infra.aliceId,
-        destinataireId: infra.bobId,
+        correspondantRecepteurId: infra.bobId,
         horodatage: horodatageFaux,
         contenu: fauxTexte
       }),
@@ -593,7 +593,7 @@ describe('Slice 3 — Modes CHIFFRE et SIGNE_ET_CHIFFRE (RSA-OAEP + AES-256-GCM)
           typeMessage: 'MSG_TEXTE',
           niveauSecurite: 'SIGNE_ET_CHIFFRE',
           emetteurId: infra.aliceId,
-          destinataireId: infra.bobId,
+          correspondantRecepteurId: infra.bobId,
           horodatage: horodatageFaux,
           contenuChiffre: fauxContenuChiffre,
           numeroSerieCertificatChiffrement: bobEnc.certificat.numeroSerie
@@ -626,7 +626,7 @@ describe('Slice 3 — Modes CHIFFRE et SIGNE_ET_CHIFFRE (RSA-OAEP + AES-256-GCM)
 });
 
 describe('Slice 4 — Rejet immédiat à l’ouverture si le Certificat d’un Correspondant est expiré, révoqué, suspendu, inconnu ou d’usage incompatible', () => {
-  it('rejette l’ouverture d’un Échange sécurisé lorsque le certificat du destinataire ou de l’initiateur est révoqué, suspendu, inconnu, expiré ou d’usage incompatible', async () => {
+  it('rejette l’ouverture d’un Échange sécurisé lorsque le certificat du Correspondant récepteur ou de l’initiateur est révoqué, suspendu, inconnu, expiré ou d’usage incompatible', async () => {
     let maintenant = new Date('2026-06-01T10:00:00Z');
     const infra = await monterInfrastructureMessagerie(() => maintenant);
 
@@ -656,12 +656,12 @@ describe('Slice 4 — Rejet immédiat à l’ouverture si le Certificat d’un C
     });
     await alice.ready();
 
-    // 1. Destinataire inconnu (aucun certificat dans l'annuaire)
+    // 1. Correspondant récepteur inconnu (aucun certificat dans l'annuaire)
     await expect(
       alice.ouvrirEchange('inconnu@dsi.organisation.fr', 'SIGNE', 'Test inconnu')
     ).rejects.toThrow(ErreurValidationCorrespondant);
 
-    // 2. Usage incompatible côté destinataire (Charlie n'a qu'un cert SIGNATURE, Alice veut CHIFFRE)
+    // 2. Usage incompatible côté Correspondant récepteur (Charlie n'a qu'un cert SIGNATURE, Alice veut CHIFFRE)
     await expect(
       alice.ouvrirEchange(infra.charlieId, 'CHIFFRE', 'Test usage incompatible')
     ).rejects.toThrow(ErreurValidationCorrespondant);
@@ -811,7 +811,7 @@ describe('Slice 5 — Invariants de session : immuabilité du niveau, séquence 
           typeMessage: 'MSG_TEXTE',
           niveauSecurite: 'NON_SECURISE',
           emetteurId: infra.aliceId,
-          destinataireId: infra.bobId,
+          correspondantRecepteurId: infra.bobId,
           horodatage: new Date().toISOString(),
           contenu: 'Downgrade injecté'
         },
@@ -894,7 +894,7 @@ describe('Slice 5 — Invariants de session : immuabilité du niveau, séquence 
           typeMessage: 'MSG_TEXTE',
           niveauSecurite: 'SIGNE_ET_CHIFFRE',
           emetteurId: infra.aliceId,
-          destinataireId: infra.bobId,
+          correspondantRecepteurId: infra.bobId,
           horodatage: new Date().toISOString(),
           contenuChiffre: apresClotureChiffre,
           numeroSerieCertificatChiffrement: bobCert.certificat.numeroSerie
@@ -983,7 +983,7 @@ describe('Slice 5 — Invariants de session : immuabilité du niveau, séquence 
         typeMessage: 'MSG_TEXTE',
         niveauSecurite: 'SIGNE',
         emetteurId: infra.aliceId,
-        destinataireId: infra.bobId,
+        correspondantRecepteurId: infra.bobId,
         horodatage,
         contenu: texte
       }),
@@ -999,7 +999,7 @@ describe('Slice 5 — Invariants de session : immuabilité du niveau, séquence 
           typeMessage: 'MSG_TEXTE',
           niveauSecurite: 'SIGNE',
           emetteurId: infra.aliceId,
-          destinataireId: infra.bobId,
+          correspondantRecepteurId: infra.bobId,
           horodatage,
           contenu: texte,
           signature: sig,

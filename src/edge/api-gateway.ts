@@ -4,7 +4,7 @@ import {
   buildRestError,
   getHeaderCaseInsensitive,
   normalizeRestPath
-} from './http-utils.js';
+} from '../utils/http.js';
 import { RateLimiter } from './rate-limiter.js';
 import type { ServiceDiscovery } from './service-discovery.js';
 

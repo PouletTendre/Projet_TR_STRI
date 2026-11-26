@@ -449,7 +449,7 @@ components:
       description: |
         Nature fonctionnelle de la Ressource adressant l'AE ou l'AV :
         - `messagerie` : clients et Correspondants de la messagerie texte sécurisée
-        - `routeurs` : équipements matériels réseau
+        - `routeurs` : Routeurs matériels
         - `services` : composants logiciels internes
         - `utilisateurs` : ressources humaines générales
       schema:

@@ -24,7 +24,7 @@ function basicAuthHeader(username: string, password: string): string {
 }
 
 describe('Slice 1 — Registre AE par nature et consultation des droits (GET /ae/{nature}/entites/{nomEntite}/droits)', () => {
-  it('authentifie via HTTP Basic ou X-Mot-De-Passe, rejette 401/404 et ne divulgue jamais le mot de passe ou son condensat', async () => {
+  it('authentifie via HTTP Basic, rejette 401/404 (y compris X-Mot-De-Passe seul) et ne divulgue jamais le mot de passe ou son condensat', async () => {
     const broker = new InMemoryAmqpBroker();
     const ae = new AutoriteEnregistrement({
       nature: 'messagerie',
@@ -113,16 +113,26 @@ describe('Slice 1 — Registre AE par nature et consultation des droits (GET /ae
     expect(JSON.stringify(droits)).not.toContain('SecretP@ss2026!');
     expect(JSON.stringify(droits)).not.toContain('motDePasse');
 
-    // 200 avec repli X-Mot-De-Passe (sans préfixe /api/v1)
-    const repOkFallback = await ae.handleRestRequest({
+    // 401 si seul l'en-tête non standard X-Mot-De-Passe est fourni (sans Authorization Basic)
+    const repFallbackRejete = await ae.handleRestRequest({
       method: 'GET',
       path: '/ae/messagerie/entites/alice.martin@dsi.organisation.fr/droits',
       headers: {
         'X-Mot-De-Passe': 'SecretP@ss2026!'
       }
     });
-    expect(repOkFallback.status).toBe(200);
-    expect((repOkFallback.body as DroitsEntiteAE).acRattachementId).toBe(
+    expect(repFallbackRejete.status).toBe(401);
+
+    // 200 avec HTTP Basic (sans préfixe /api/v1)
+    const repOkSansPrefixe = await ae.handleRestRequest({
+      method: 'GET',
+      path: '/ae/messagerie/entites/alice.martin@dsi.organisation.fr/droits',
+      headers: {
+        Authorization: basicAuthHeader('alice.martin@dsi.organisation.fr', 'SecretP@ss2026!')
+      }
+    });
+    expect(repOkSansPrefixe.status).toBe(200);
+    expect((repOkSansPrefixe.body as DroitsEntiteAE).acRattachementId).toBe(
       'AC-N3-DSI-MESSAGERIE'
     );
 
@@ -614,5 +624,62 @@ describe('Slice 4 — Génération optionnelle de Biclé (genererBicle: true), r
       path: `/annuaire/certificats/${bodyPrete.certificat!.numeroSerie}`
     });
     expect(repAnnuaire.status).toBe(200);
+  });
+
+  it('purge automatiquement une clePriveeGeneree différée après expiration du TTL (ttlClePriveeEphemeresMs)', async () => {
+    const broker = new InMemoryAmqpBroker();
+    const hierarchie = await amorcerHierarchieAc(broker);
+    const acReseau = hierarchie.services.infraReseau;
+
+    acReseau.suspendreConsommation();
+
+    const aeRouteurs = new AutoriteEnregistrement({
+      nature: 'routeurs',
+      broker,
+      delaiReponseAcMs: 20,
+      ttlClePriveeEphemeresMs: 40,
+      entites: [
+        {
+          nomEntite: 'routeur-ttl-03.infra.organisation.fr',
+          motDePasse: 'TtlRouter#2026',
+          droitSignature: true,
+          droitChiffrement: false,
+          droitDemandeRevocation: true,
+          acRattachementId: 'AC-N3-INFRA-RESEAU'
+        }
+      ]
+    });
+    await aeRouteurs.ready();
+
+    try {
+      const repDifferee = await aeRouteurs.handleRestRequest({
+        method: 'POST',
+        path: '/api/v1/ae/routeurs/demandes-certification',
+        body: {
+          nomEntite: 'routeur-ttl-03.infra.organisation.fr',
+          motDePasse: 'TtlRouter#2026',
+          usage: 'SIGNATURE',
+          genererBicle: true
+        }
+      });
+
+      expect(repDifferee.status).toBe(202);
+      const body202 = repDifferee.body as DemandeCertificationReponse;
+
+      await acReseau.reprendreConsommation();
+      await new Promise((resolve) => setTimeout(resolve, 80));
+
+      const repExpiree = await aeRouteurs.handleRestRequest({
+        method: 'GET',
+        path: `/api/v1/ae/routeurs/demandes-certification/${body202.demandeId}`
+      });
+      expect(repExpiree.status).toBe(200);
+      const bodyExpiree = repExpiree.body as DemandeCertificationReponse;
+      expect(bodyExpiree.statutDemande).toBe('EMISE');
+      expect(bodyExpiree.certificat).toBeDefined();
+      expect(bodyExpiree.clePriveeGeneree).toBeNull();
+    } finally {
+      await aeRouteurs.arreter();
+    }
   });
 });

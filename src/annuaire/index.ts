@@ -11,6 +11,7 @@ import type {
   RestRequest,
   RestResponse
 } from '../types/index.js';
+import { buildRestError, normalizeRestPath } from '../utils/http.js';
 
 export const QUEUE_PUBLICATION_FLUX = 'q.pki.publication.flux';
 
@@ -36,28 +37,11 @@ function cloneAutoriteInfo(info: AutoriteCertificationInfo): AutoriteCertificati
   };
 }
 
-function buildError(
-  status: number,
-  code: string,
-  message: string,
-  chemin: string
-): RestResponse<ErreurApi> {
-  return {
-    status,
-    body: {
-      code,
-      message,
-      horodatage: new Date().toISOString(),
-      chemin
-    }
-  };
-}
-
 function parsePathAndQuery(
   rawPath: string,
   explicitQuery?: Record<string, string | number | boolean | undefined>
 ): { normalizedPath: string; query: Record<string, string | number | boolean | undefined> } {
-  const [pathOnly, queryString] = rawPath.split('?', 2);
+  const [, queryString] = rawPath.split('?', 2);
   const query: Record<string, string | number | boolean | undefined> = {};
 
   if (queryString) {
@@ -75,15 +59,7 @@ function parsePathAndQuery(
     }
   }
 
-  let normalizedPath = pathOnly ?? '/';
-  if (normalizedPath.startsWith('/api/v1')) {
-    normalizedPath = normalizedPath.slice('/api/v1'.length) || '/';
-  }
-  if (normalizedPath.length > 1 && normalizedPath.endsWith('/')) {
-    normalizedPath = normalizedPath.slice(0, -1);
-  }
-
-  return { normalizedPath, query };
+  return { normalizedPath: normalizeRestPath(rawPath), query };
 }
 
 function parseBooleanQuery(
@@ -155,7 +131,7 @@ export class ServicePublication {
     const { normalizedPath, query } = parsePathAndQuery(req.path, req.query);
 
     if (method !== 'GET') {
-      return buildError(
+      return buildRestError(
         405,
         'METHODE_NON_AUTORISEE',
         `Méthode HTTP "${method}" non supportée sur le Service de Publication.`,
@@ -192,7 +168,7 @@ export class ServicePublication {
       return this.getLcrConsolidee();
     }
 
-    return buildError(
+    return buildRestError(
       404,
       'ROUTE_INTROUVABLE',
       `Ressource REST introuvable : "${req.path}".`,
@@ -302,7 +278,7 @@ export class ServicePublication {
   ): RestResponse<Certificat | ErreurApi> {
     const cert = this.certificats.get(numeroSerie);
     if (!cert) {
-      return buildError(
+      return buildRestError(
         404,
         'CERTIFICAT_INTROUVABLE',
         `Aucun certificat trouvé pour le numéro de série "${numeroSerie}".`,
@@ -322,7 +298,7 @@ export class ServicePublication {
   ): RestResponse<CheminCertificationReponse | ErreurApi> {
     const cible = this.certificats.get(numeroSerie);
     if (!cible) {
-      return buildError(
+      return buildRestError(
         404,
         'CERTIFICAT_INTROUVABLE',
         `Aucun certificat trouvé pour le numéro de série "${numeroSerie}".`,
@@ -374,7 +350,7 @@ export class ServicePublication {
           ? query.niveau
           : Number.parseInt(String(query.niveau), 10);
       if (!Number.isInteger(parsed) || parsed < 1) {
-        return buildError(
+        return buildRestError(
           400,
           'REQUETE_INVALIDE',
           `Le paramètre "niveau" doit être un entier positif.`,
@@ -401,7 +377,7 @@ export class ServicePublication {
   ): RestResponse<ListeCertificatsRevoques | ErreurApi> {
     const lcr = this.lcrs.get(acId);
     if (!lcr) {
-      return buildError(
+      return buildRestError(
         404,
         'AUTORITE_INTROUVABLE',
         `Aucune LCR publiée trouvée pour l'AC "${acId}".`,
