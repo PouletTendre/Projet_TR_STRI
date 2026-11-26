@@ -8,6 +8,8 @@
   },
   "type": "module",
   "scripts": {
+    "build": "tsc",
+    "demo": "tsc && node dist/demo.js",
     "test": "vitest run",
     "typecheck": "tsc --noEmit"
   },
