@@ -14,7 +14,9 @@ Conception et prototype exécutable autonome d'une **Infrastructure à Clés Pub
 | [docs/adr/0002-decouplage-ae-av-et-hierarchie-ac.md](./docs/adr/0002-decouplage-ae-av-et-hierarchie-ac.md) | **ADR 0002** — Découplage entre les AE/AV mutualisées par nature de Ressource et la hiérarchie d'AC à 3 niveaux calquée sur l'organisation. |
 | [docs/spec.md](./docs/spec.md) | **Spécification de refonte (Spec #10)** : objectifs, User Stories, décisions d'architecture AMQP 0-9-1 / PlantUML et stratégie de test sur 2 coutures. |
 
-### Diagrammes PlantUML autonomes (`docs/diagrams/`)
+### Diagrammes PlantUML autonomes et rendus SVG (`docs/diagrams/`)
+
+Chaque source `.puml` est compilée en `.svg` dans `docs/diagrams/` et intégrée directement dans [docs/dossier-conception.md](./docs/dossier-conception.md).
 
 | Fichier | Vue modélisée |
 | :--- | :--- |

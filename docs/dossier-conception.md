@@ -97,6 +97,11 @@ Le système réparti implique quatre acteurs canoniques :
 
 ### 2.2 Diagramme de cas d'utilisation UML
 
+![Diagramme de cas d'utilisation UML](./diagrams/01-cas-utilisation.svg)
+
+<details>
+<summary>Voir la source PlantUML (01-cas-utilisation.puml)</summary>
+
 Source autonome : [01-cas-utilisation.puml](./diagrams/01-cas-utilisation.puml)
 
 ```plantuml
@@ -133,6 +138,8 @@ UC_Messagerie ..> UC_Validation : <<include>>
 @enduml
 ```
 
+</details>
+
 ---
 
 ## 3. Entités logicielles réparties et architecture en blocs
@@ -151,6 +158,11 @@ Conformément à l'[ADR 0002](./adr/0002-decouplage-ae-av-et-hierarchie-ac.md), 
 | **Messagerie Sécurisée** | Service logique de remise de **Messages** | Acheminent les **Messages** entre deux **Correspondants** selon le **Niveau de sécurité** verrouillé lors du premier **Message** jusqu'à la clôture explicite par `FIN_MSG`. |
 
 ### 3.2 Architecture globale en 6 blocs
+
+![Architecture globale en 6 grands blocs métier](./diagrams/02-architecture-blocs.svg)
+
+<details>
+<summary>Voir la source PlantUML (02-architecture-blocs.puml)</summary>
 
 Source autonome : [02-architecture-blocs.puml](./diagrams/02-architecture-blocs.puml)
 
@@ -176,9 +188,16 @@ Ressources <--> Messagerie : Échanges de Messages sécurisés\net clôture FIN_
 @enduml
 ```
 
+</details>
+
 ### 3.3 Hiérarchie d'AC sur 3 niveaux
 
 La certification des **AC Filles** (niveau 1 $\rightarrow$ niveau 2 et niveau 2 $\rightarrow$ niveau 3) relève d'une administration interne directe entre **AC** parente et **AC Fille** ; les **AE** interviennent exclusivement pour les **Porteurs** finaux.
+
+![Hiérarchie d'AC sur 3 niveaux](./diagrams/03-hierarchie-ac.svg)
+
+<details>
+<summary>Voir la source PlantUML (03-hierarchie-ac.puml)</summary>
 
 Source autonome : [03-hierarchie-ac.puml](./diagrams/03-hierarchie-ac.puml)
 
@@ -213,6 +232,8 @@ AC_N3_USR --> P_USR : Émission de Certificats\n(via AE utilisateurs)
 @enduml
 ```
 
+</details>
+
 ---
 
 ## 4. Interactions dynamiques
@@ -222,6 +243,11 @@ Les quatre diagrammes de séquence ci-dessous décrivent les interactions métie
 ### 4.1 Processus de création de Certificat
 
 Dans le flux nominal, le **Porteur** génère sa **Biclé** localement, conserve sa clé privée secrète et ne soumet que sa clé publique à l'**AE** de sa nature. En variante optionnelle (par exemple pour un routeur contraint), le **Porteur** peut déléguer la création de la **Biclé** à l'**AC**, qui retourne la clé privée générée une unique fois sans la conserver ni côté **AC** ni côté **AE**.
+
+![Diagramme de séquence — Création de Certificat](./diagrams/04-sequence-creation-certificat.svg)
+
+<details>
+<summary>Voir la source PlantUML (04-sequence-creation-certificat.puml)</summary>
 
 Source autonome : [04-sequence-creation-certificat.puml](./diagrams/04-sequence-creation-certificat.puml)
 
@@ -252,9 +278,16 @@ end
 @enduml
 ```
 
+</details>
+
 ### 4.2 Processus de Révocation, Suspension et Réactivation
 
 Avant la date de fin de validité d'un **Certificat**, son **Porteur** peut demander auprès de l'**AE** sa **Révocation** (irréversible), sa **Suspension** (réversible) ou sa **Réactivation** (levée d'une **Suspension**). L'**AE** contrôle l'authentification, le droit `droit_de_demande_de_revocation` et la correspondance entre le demandeur et le **Sujet** du **Certificat** ; l'**AC** vérifie les invariants du cycle de vie puis publie immédiatement sa **LCR** signée.
+
+![Diagramme de séquence — Révocation, Suspension et Réactivation](./diagrams/05-sequence-revocation-suspension.svg)
+
+<details>
+<summary>Voir la source PlantUML (05-sequence-revocation-suspension.puml)</summary>
 
 Source autonome : [05-sequence-revocation-suspension.puml](./diagrams/05-sequence-revocation-suspension.puml)
 
@@ -285,9 +318,16 @@ end
 @enduml
 ```
 
+</details>
+
 ### 4.3 Processus de validation en 4 étapes
 
 L'**Utilisateur ICP** orchestre lui-même les 4 étapes obligatoires de validation à partir de l'ancre de confiance de l'**AC Racine**, des preuves récupérées auprès du **Service de Publication**, et du statut courant interrogé auprès de l'**AV** (sur le **Certificat** cible ainsi que sur chaque **AC Fille** intermédiaire du **Chemin de certification**).
+
+![Diagramme de séquence — Validation en 4 étapes](./diagrams/06-sequence-validation-4-etapes.svg)
+
+<details>
+<summary>Voir la source PlantUML (06-sequence-validation-4-etapes.puml)</summary>
 
 Source autonome : [06-sequence-validation-4-etapes.puml](./diagrams/06-sequence-validation-4-etapes.puml)
 
@@ -313,9 +353,16 @@ User -> User : Étape 4 — Contrôler la politique d'usage\n(SIGNATURE, CHIFFRE
 @enduml
 ```
 
+</details>
+
 ### 4.4 Processus de Messagerie Sécurisée (« chat » et `FIN_MSG`)
 
 Lors de l'initialisation d'un **Échange**, le **Correspondant** initiateur choisit le **Niveau de sécurité** (`NON_SECURISE`, `SIGNE`, `CHIFFRE` ou `SIGNE_ET_CHIFFRE`). Hors mode `NON_SECURISE`, chacun des deux **Correspondants** valide en 4 étapes le **Certificat** de son partenaire et vérifie le sien. Le **Niveau de sécurité** est verrouillé de manière immuable dès le premier **Message** et chaque envoi ultérieur contrôle l'absence de révocation/suspension jusqu'à réception d'un **Message** contenant uniquement `FIN_MSG`.
+
+![Diagramme de séquence — Messagerie Sécurisée et clôture FIN_MSG](./diagrams/07-sequence-messagerie-securisee.svg)
+
+<details>
+<summary>Voir la source PlantUML (07-sequence-messagerie-securisee.puml)</summary>
 
 Source autonome : [07-sequence-messagerie-securisee.puml](./diagrams/07-sequence-messagerie-securisee.puml)
 
@@ -358,6 +405,8 @@ B -> B : Clore l'Échange et rejeter tout Message ultérieur
 @enduml
 ```
 
+</details>
+
 ---
 
 ## 5. Choix argumentés sur les technologies de répartition
@@ -378,6 +427,11 @@ Conformément à l'[ADR 0001](./adr/0001-repartition-hybride-rest-amqp.md), l'ar
 ## 6. Architecture AMQP 0-9-1 complète
 
 ### 6.1 Vue topologique AMQP 0-9-1
+
+![Architecture AMQP 0-9-1 complète](./diagrams/08-architecture-amqp.svg)
+
+<details>
+<summary>Voir la source PlantUML (08-architecture-amqp.puml)</summary>
 
 Source autonome : [08-architecture-amqp.puml](./diagrams/08-architecture-amqp.puml)
 
@@ -432,6 +486,8 @@ Q_Av --> Cons_AV : mise à jour statut courant
 Q_Chat --> Cons_Chat : remise du Message
 @enduml
 ```
+
+</details>
 
 ### 6.2 Inventaire des 3 échangeurs durables
 
@@ -689,6 +745,11 @@ En complément des 11 routes métier décrites dans [openapi/pki-api.yaml](../op
 
 La couche Edge isole les services internes de l'ICP et le courtier AMQP 0-9-1 vis-à-vis des **Ressources** externes au travers de quatre micro-services complémentaires, représentés sans dépendance à un outil vendeur.
 
+![Architecture de la couche Micro-services Edge](./diagrams/09-microservices-edge.svg)
+
+<details>
+<summary>Voir la source PlantUML (09-microservices-edge.puml)</summary>
+
 Source autonome : [09-microservices-edge.puml](./diagrams/09-microservices-edge.puml)
 
 ```plantuml
@@ -720,6 +781,8 @@ MsgGW <--> Messagerie : Cloisonnement ACL strict\n(ex.chat.messages & q.chat.inb
 ServicesICP <--> Messagerie : Commandes & publications internes
 @enduml
 ```
+
+</details>
 
 ### 8.2 Justification des 4 rôles Edge
 

@@ -649,7 +649,7 @@ describe('Conformité documentaire — OpenAPI 3.0.3 & Diagrammes PlantUML', () 
       }
     });
 
-    it('doit embarquer les 9 blocs PlantUML identiques caractère pour caractère aux fichiers .puml autonomes et les lier', () => {
+    it('doit embarquer les 9 blocs PlantUML identiques caractère pour caractère aux fichiers .puml autonomes, leurs rendus SVG compilés et les lier', () => {
       const dossier = readFileSync(DOSSIER_PATH, 'utf8');
       const blocks = [...dossier.matchAll(/```plantuml\r?\n([\s\S]*?)\r?\n```/g)].map(
         (m) => m[1] ?? '',
@@ -660,6 +660,15 @@ describe('Conformité documentaire — OpenAPI 3.0.3 & Diagrammes PlantUML', () 
         const expected = readFileSync(resolve(DIAGRAMS_DIR, file), 'utf8').replace(/\r?\n$/, '');
         expect(blocks[index], `Bloc PlantUML #${index + 1} (${file})`).toBe(expected);
         expect(dossier).toContain(`./diagrams/${file}`);
+
+        const svgFile = file.replace(/\.puml$/, '.svg');
+        const svgPath = resolve(DIAGRAMS_DIR, svgFile);
+        expect(existsSync(svgPath), `Rendu SVG manquant : ${svgFile}`).toBe(true);
+        const svgContent = readFileSync(svgPath, 'utf8');
+        expect(svgContent).toContain('<svg');
+        expect(svgContent).toContain('</svg>');
+        expect(svgContent).not.toContain('Syntax Error');
+        expect(dossier).toContain(`./diagrams/${svgFile}`);
       });
     });
 
