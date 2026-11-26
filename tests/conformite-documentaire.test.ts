@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
-import { existsSync, readFileSync, readdirSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
+import { dirname, relative, resolve } from 'node:path';
 
 const REPO_ROOT = resolve(import.meta.dirname, '..');
 const OPENAPI_PATH = resolve(REPO_ROOT, 'openapi', 'pki-api.yaml');
@@ -11,6 +11,60 @@ const FORBIDDEN_LEGACY_PROTOCOL_REGEX = new RegExp(`${'j' + 'ms'}`, 'i');
 const FORBIDDEN_LEGACY_DEST_REGEX = /\b(topic|queue)\.(pki|chat)\./i;
 const FORBIDDEN_VENDOR_NAMES_REGEX =
   /\b(rabbitmq|activemq|kafka|kong|envoy|consul|eureka|spring|nginx|docker)\b/i;
+
+const FORBIDDEN_REPO_GLOBAL_PATTERNS: Array<{ label: string; regex: RegExp }> = [
+  { label: 'protocole hérité (mot entier)', regex: new RegExp(`\\b${'j' + 'ms'}\\b`, 'i') },
+  { label: 'adaptateur hérité InMemory*', regex: new RegExp(`InMemory${'J' + 'ms'}`) },
+  { label: 'en-tête hérité *CorrelationID', regex: new RegExp(`${'J' + 'MS'}CorrelationID`) },
+  { label: 'en-tête hérité *ReplyTo', regex: new RegExp(`${'J' + 'MS'}ReplyTo`) },
+  { label: 'bloc diagramme non-PlantUML', regex: new RegExp(`\`\`\`${'mer' + 'maid'}`, 'i') },
+];
+
+function extractRelativeLinks(markdown: string): string[] {
+  const withoutCodeBlocks = markdown.replace(/```[\s\S]*?```/g, '');
+  const links: string[] = [];
+  for (const match of withoutCodeBlocks.matchAll(/\[[^\]]*\]\(([^)]+)\)/g)) {
+    const rawTarget = match[1]?.trim() ?? '';
+    if (
+      rawTarget === '' ||
+      rawTarget.startsWith('#') ||
+      /^https?:\/\//i.test(rawTarget) ||
+      /^mailto:/i.test(rawTarget)
+    ) {
+      continue;
+    }
+    const fileTarget = rawTarget.split('#')[0]?.trim() ?? '';
+    if (fileTarget !== '') {
+      links.push(fileTarget);
+    }
+  }
+  return links;
+}
+
+function collectFilesRecursively(dirPath: string): string[] {
+  if (!existsSync(dirPath)) {
+    return [];
+  }
+  const results: string[] = [];
+  for (const entry of readdirSync(dirPath)) {
+    if (
+      entry === 'node_modules' ||
+      entry === 'dist' ||
+      entry === '.git' ||
+      entry.startsWith('wt-')
+    ) {
+      continue;
+    }
+    const fullPath = resolve(dirPath, entry);
+    const stats = statSync(fullPath);
+    if (stats.isDirectory()) {
+      results.push(...collectFilesRecursively(fullPath));
+    } else if (stats.isFile()) {
+      results.push(fullPath);
+    }
+  }
+  return results;
+}
 
 const TECH_NEUTRAL_FORBIDDEN_PATTERNS: RegExp[] = [
   /\brest\b/i,
@@ -572,6 +626,172 @@ describe('Conformité documentaire — OpenAPI 3.0.3 & Diagrammes PlantUML', () 
       expect(content).not.toMatch(FORBIDDEN_VENDOR_NAMES_REGEX);
       expect(content).not.toMatch(FORBIDDEN_LEGACY_PROTOCOL_REGEX);
       expect(content).not.toMatch(/\b(websocket|stomp)\b/i);
+    });
+  });
+
+  describe('Dossier de conception (docs/dossier-conception.md)', () => {
+    const DOSSIER_PATH = resolve(REPO_ROOT, 'docs', 'dossier-conception.md');
+
+    it('doit couvrir les 8 sections attendues par le sujet 2026–2027', () => {
+      const dossier = readFileSync(DOSSIER_PATH, 'utf8');
+      const requiredSectionHeadings = [
+        /^## 1\. Contexte, Domaine de confiance et modèle du noyau/m,
+        /^## 2\. Vue fonctionnelle/m,
+        /^## 3\. Entités logicielles réparties et architecture en blocs/m,
+        /^## 4\. Interactions dynamiques/m,
+        /^## 5\. Choix argumentés sur les technologies de répartition/m,
+        /^## 6\. Architecture AMQP 0-9-1 complète/m,
+        /^## 7\. Ressources REST, schéma de nommage et spécification OpenAPI 3\.0\.3/m,
+        /^## 8\. Micro-services « Edge »/m,
+      ];
+      for (const heading of requiredSectionHeadings) {
+        expect(dossier, `Section manquante : ${heading}`).toMatch(heading);
+      }
+    });
+
+    it('doit embarquer les 9 blocs PlantUML identiques caractère pour caractère aux fichiers .puml autonomes et les lier', () => {
+      const dossier = readFileSync(DOSSIER_PATH, 'utf8');
+      const blocks = [...dossier.matchAll(/```plantuml\r?\n([\s\S]*?)\r?\n```/g)].map(
+        (m) => m[1] ?? '',
+      );
+      expect(blocks).toHaveLength(EXPECTED_DIAGRAMS.length);
+
+      EXPECTED_DIAGRAMS.forEach((file, index) => {
+        const expected = readFileSync(resolve(DIAGRAMS_DIR, file), 'utf8').replace(/\r?\n$/, '');
+        expect(blocks[index], `Bloc PlantUML #${index + 1} (${file})`).toBe(expected);
+        expect(dossier).toContain(`./diagrams/${file}`);
+      });
+    });
+
+    it('doit spécifier en Section 6 les 3 échangeurs, 5 files durables et 9 types de messages JSON', () => {
+      const dossier = readFileSync(DOSSIER_PATH, 'utf8');
+      const sec6Start = dossier.search(/^## 6\. Architecture AMQP 0-9-1 complète/m);
+      const sec7Start = dossier.search(/^## 7\. Ressources REST/m);
+      expect(sec6Start).toBeGreaterThan(-1);
+      expect(sec7Start).toBeGreaterThan(sec6Start);
+      const sec6 = dossier.slice(sec6Start, sec7Start);
+
+      for (const exchange of ['ex.pki.commandes', 'ex.pki.publications', 'ex.chat.messages']) {
+        expect(sec6).toContain(exchange);
+      }
+      for (const queue of [
+        'q.pki.ac.<id_ac>.demandes',
+        'q.pki.ae.<id_ae>.reponses',
+        'q.pki.publication.flux',
+        'q.pki.av.<nature>.flux',
+        'q.chat.inbox.<id_correspondant>',
+      ]) {
+        expect(sec6).toContain(queue);
+      }
+      for (const messageType of [
+        'DEMANDE_CERTIFICATION',
+        'REPONSE_CERTIFICATION',
+        'DEMANDE_REVOCATION',
+        'REPONSE_REVOCATION',
+        'PUBLICATION_CERTIFICAT',
+        'PUBLICATION_LCR',
+        'INIT_ECHANGE',
+        'MSG_TEXTE',
+        'FIN_MSG',
+      ]) {
+        expect(sec6).toContain(messageType);
+      }
+    });
+
+    it('ne doit contenir aucun lien Markdown relatif cassé dans docs/dossier-conception.md', () => {
+      const dossier = readFileSync(DOSSIER_PATH, 'utf8');
+      const links = extractRelativeLinks(dossier);
+      expect(links.length).toBeGreaterThan(0);
+      for (const target of links) {
+        const resolved = resolve(dirname(DOSSIER_PATH), target);
+        expect(existsSync(resolved), `Lien cassé dans dossier-conception.md : ${target}`).toBe(
+          true,
+        );
+      }
+    });
+  });
+
+  describe('Documentation racine & Spécification (README.md, docs/spec.md)', () => {
+    const README_PATH = resolve(REPO_ROOT, 'README.md');
+    const SPEC_PATH = resolve(REPO_ROOT, 'docs', 'spec.md');
+
+    it('README.md doit référencer le sujet 2026–2027, tous les livrables et les commandes du PoC sans lien cassé', () => {
+      const readme = readFileSync(README_PATH, 'utf8');
+
+      for (const expectedRef of [
+        'Projet_TR_STRI_2026_2027.pdf',
+        'docs/dossier-conception.md',
+        'openapi/pki-api.yaml',
+        'GLOSSARY.md',
+        'docs/adr/0001-repartition-hybride-rest-amqp.md',
+        'docs/adr/0002-decouplage-ae-av-et-hierarchie-ac.md',
+        'docs/spec.md',
+        ...EXPECTED_DIAGRAMS.map((d) => `docs/diagrams/${d}`),
+      ]) {
+        expect(readme, `Référence manquante dans README.md : ${expectedRef}`).toContain(expectedRef);
+      }
+
+      for (const cmd of ['npm ci', 'npm run typecheck', 'npm test', 'npm run demo']) {
+        expect(readme, `Commande manquante dans README.md : ${cmd}`).toContain(cmd);
+      }
+
+      const links = extractRelativeLinks(readme);
+      expect(links.length).toBeGreaterThan(0);
+      for (const target of links) {
+        const resolved = resolve(dirname(README_PATH), target);
+        expect(existsSync(resolved), `Lien cassé dans README.md : ${target}`).toBe(true);
+      }
+    });
+
+    it('docs/spec.md doit être aligné sur la spec #10 (AMQP 0-9-1, PlantUML, 2 coutures) sans lien cassé', () => {
+      const spec = readFileSync(SPEC_PATH, 'utf8');
+      for (const token of [
+        'AMQP 0-9-1',
+        'PlantUML',
+        'ex.pki.commandes',
+        'ex.pki.publications',
+        'ex.chat.messages',
+        'Passerelle Edge Messagerie',
+      ]) {
+        expect(spec, `Terme manquant dans docs/spec.md : ${token}`).toContain(token);
+      }
+      expect(spec).not.toMatch(/2022–2023|2022-2023/);
+
+      const links = extractRelativeLinks(spec);
+      expect(links.length).toBeGreaterThan(0);
+      for (const target of links) {
+        const resolved = resolve(dirname(SPEC_PATH), target);
+        expect(existsSync(resolved), `Lien cassé dans docs/spec.md : ${target}`).toBe(true);
+      }
+    });
+  });
+
+  describe('Vérification globale du dépôt (zéro protocole hérité & zéro diagramme non-PlantUML)', () => {
+    it('ne doit contenir aucune occurrence du protocole hérité ni aucun bloc diagramme hérité dans tout le dépôt', () => {
+      const targetFiles: string[] = [
+        ...collectFilesRecursively(resolve(REPO_ROOT, 'src')),
+        ...collectFilesRecursively(resolve(REPO_ROOT, 'tests')),
+        ...collectFilesRecursively(resolve(REPO_ROOT, 'docs')),
+        ...collectFilesRecursively(resolve(REPO_ROOT, 'openapi')),
+        resolve(REPO_ROOT, 'GLOSSARY.md'),
+        resolve(REPO_ROOT, 'README.md'),
+        resolve(REPO_ROOT, 'package.json'),
+      ];
+
+      expect(targetFiles.length).toBeGreaterThan(10);
+
+      for (const filePath of targetFiles) {
+        expect(existsSync(filePath), `Fichier attendu manquant : ${filePath}`).toBe(true);
+        const relPath = relative(REPO_ROOT, filePath);
+        const content = readFileSync(filePath, 'utf8');
+
+        for (const { label, regex } of FORBIDDEN_REPO_GLOBAL_PATTERNS) {
+          expect(
+            regex.test(content),
+            `${relPath} ne doit contenir aucune occurrence (${label})`,
+          ).toBe(false);
+        }
+      }
     });
   });
 });
