@@ -7,21 +7,48 @@ import {
   type RsaKeyPair
 } from '../crypto/index.js';
 import type {
+  ActionRevocation,
   AmqpMessage,
   AutoriteCertificationInfo,
   Certificat,
   CommandeDemandeCertificationPayload,
+  CommandeDemandeRevocationPayload,
   EntreeLcr,
   ListeCertificatsRevoques,
+  MotifRevocation,
   PublicationCertificatPayload,
   PublicationLcrPayload,
-  ReponseDemandeCertificationPayload
+  ReponseDemandeCertificationPayload,
+  ReponseDemandeRevocationPayload,
+  StatutCertificat
 } from '../types/index.js';
 
 export interface OptionsValiditeAc {
   dateDebut?: Date;
   dureeValiditeJours?: number;
+  horloge?: () => Date;
 }
+
+export interface ResultatInvalidationSucces {
+  succes: true;
+  numeroSerieCertificat: string;
+  identifiantAc: string;
+  actionAppliquee: ActionRevocation;
+  nouvelEtatCertificat: StatutCertificat;
+  horodatagePublicationLcr: string;
+  lcr: ListeCertificatsRevoques;
+}
+
+export interface ResultatInvalidationRejet {
+  succes: false;
+  httpStatus: 404 | 409;
+  code: 'CERTIFICAT_INTROUVABLE' | 'CERTIFICAT_EXPIRE' | 'TRANSITION_INVALIDE';
+  message: string;
+}
+
+export type ResultatInvalidation =
+  | ResultatInvalidationSucces
+  | ResultatInvalidationRejet;
 
 export function queueAcDemandes(acId: string): string {
   return `q.pki.ac.${acId}.demandes`;
@@ -84,6 +111,7 @@ export interface AutoriteCertificationConfig {
   broker: InMemoryAmqpBroker;
   generateurNumeroSerie: GenerateurNumeroSerie;
   keyPair?: RsaKeyPair;
+  horloge?: () => Date;
 }
 
 /**
@@ -99,6 +127,7 @@ export class AutoriteCertification {
   private readonly broker: InMemoryAmqpBroker;
   private readonly generateurNumeroSerie: GenerateurNumeroSerie;
   private readonly keyPair: RsaKeyPair;
+  private readonly horloge: () => Date;
   private certificatAc: Certificat | null = null;
   private readonly certificatsEmis = new Map<string, Certificat>();
   private numeroVersionLcr = 0;
@@ -114,7 +143,8 @@ export class AutoriteCertification {
     this.broker = config.broker;
     this.generateurNumeroSerie = config.generateurNumeroSerie;
     this.keyPair = config.keyPair ?? generateRsaKeyPair();
-    this.lcrCourante = this.construireEtSignerLcr(new Date());
+    this.horloge = config.horloge ?? (() => new Date());
+    this.lcrCourante = this.construireEtSignerLcr(this.horloge());
   }
 
   get clePubliqueBase64(): string {
@@ -190,7 +220,7 @@ export class AutoriteCertification {
     const payload: PublicationLcrPayload = { lcr };
     await this.broker.publish(
       AMQP_EXCHANGES.PUBLICATIONS,
-      `lcr.n${this.niveau}.${this.acId.toLowerCase()}`,
+      `lcr.${this.acId}`,
       payload,
       {
         type: 'PUBLICATION_LCR',
@@ -202,6 +232,109 @@ export class AutoriteCertification {
       }
     );
     return lcr;
+  }
+
+  /**
+   * Applique une transition de cycle de vie (REVOCATION, SUSPENSION, REACTIVATION)
+   * sur un Certificat émis par cette AC (Porteur pour AC N3, ou AC Fille pour AC N1/N2),
+   * reconstruit et signe la LCR incrémentée puis la publie sur `ex.pki.publications`.
+   */
+  async traiterInvalidation(
+    numeroSerie: string,
+    action: ActionRevocation,
+    motif?: MotifRevocation,
+    dateCourante?: Date
+  ): Promise<ResultatInvalidation> {
+    const cert = this.certificatsEmis.get(numeroSerie);
+    if (!cert) {
+      return {
+        succes: false,
+        httpStatus: 404,
+        code: 'CERTIFICAT_INTROUVABLE',
+        message: `Aucun certificat émis par "${this.acId}" pour le numéro de série "${numeroSerie}".`
+      };
+    }
+
+    const maintenant = dateCourante ?? this.horloge();
+    if (maintenant.getTime() > new Date(cert.dateFinValidite).getTime()) {
+      return {
+        succes: false,
+        httpStatus: 409,
+        code: 'CERTIFICAT_EXPIRE',
+        message: `Le certificat "${numeroSerie}" est expiré depuis le ${cert.dateFinValidite}.`
+      };
+    }
+
+    const entreeCourante = this.entreesLcr.get(numeroSerie);
+    const etatCourant: StatutCertificat = entreeCourante ? entreeCourante.statut : 'VALIDE';
+
+    if (etatCourant === 'REVOQUE') {
+      return {
+        succes: false,
+        httpStatus: 409,
+        code: 'TRANSITION_INVALIDE',
+        message: `Le certificat "${numeroSerie}" est définitivement révoqué ; aucune transition ultérieure n'est autorisée.`
+      };
+    }
+
+    let nouvelEtat: StatutCertificat;
+
+    if (action === 'SUSPENSION') {
+      if (etatCourant !== 'VALIDE') {
+        return {
+          succes: false,
+          httpStatus: 409,
+          code: 'TRANSITION_INVALIDE',
+          message: `Impossible de suspendre le certificat "${numeroSerie}" depuis l'état "${etatCourant}".`
+        };
+      }
+      nouvelEtat = 'SUSPENDU';
+      this.entreesLcr.set(numeroSerie, {
+        numeroSerieCertificat: numeroSerie,
+        statut: 'SUSPENDU',
+        dateInvalidation: maintenant.toISOString(),
+        motif: motif ?? 'SUSPENSION_TEMPORAIRE'
+      });
+    } else if (action === 'REACTIVATION') {
+      if (etatCourant !== 'SUSPENDU') {
+        return {
+          succes: false,
+          httpStatus: 409,
+          code: 'TRANSITION_INVALIDE',
+          message: `Impossible de réactiver le certificat "${numeroSerie}" depuis l'état "${etatCourant}".`
+        };
+      }
+      nouvelEtat = 'VALIDE';
+      this.entreesLcr.delete(numeroSerie);
+    } else if (action === 'REVOCATION') {
+      nouvelEtat = 'REVOQUE';
+      this.entreesLcr.set(numeroSerie, {
+        numeroSerieCertificat: numeroSerie,
+        statut: 'REVOQUE',
+        dateInvalidation: maintenant.toISOString(),
+        motif: motif ?? 'AUTRE'
+      });
+    } else {
+      return {
+        succes: false,
+        httpStatus: 409,
+        code: 'TRANSITION_INVALIDE',
+        message: `Action de révocation inconnue : "${String(action)}".`
+      };
+    }
+
+    this.lcrCourante = this.construireEtSignerLcr(maintenant);
+    const lcr = await this.publierLcr();
+
+    return {
+      succes: true,
+      numeroSerieCertificat: numeroSerie,
+      identifiantAc: this.acId,
+      actionAppliquee: action,
+      nouvelEtatCertificat: nouvelEtat,
+      horodatagePublicationLcr: lcr.dateEmission,
+      lcr
+    };
   }
 
   protected definirCertificatAc(certificat: Certificat): void {
@@ -275,10 +408,82 @@ export class AutoriteCertification {
   }
 
   private async traiterCommandeAmqp(message: AmqpMessage): Promise<void> {
-    if (message.properties.type !== 'DEMANDE_CERTIFICATION') {
+    if (message.properties.type === 'DEMANDE_CERTIFICATION') {
+      await this.traiterDemandeCertificationAmqp(message);
+      return;
+    }
+    if (message.properties.type === 'DEMANDE_REVOCATION') {
+      await this.traiterDemandeRevocationAmqp(message);
+      return;
+    }
+  }
+
+  private async traiterDemandeRevocationAmqp(message: AmqpMessage): Promise<void> {
+    const payload = message.payload as Partial<CommandeDemandeRevocationPayload> | null;
+    const correlationId = message.properties.correlation_id ?? payload?.demandeId;
+    const replyTo = message.properties.reply_to;
+
+    if (
+      !payload ||
+      !payload.demandeId ||
+      !payload.numeroSerieCertificat ||
+      (payload.action !== 'REVOCATION' &&
+        payload.action !== 'SUSPENSION' &&
+        payload.action !== 'REACTIVATION')
+    ) {
+      if (replyTo && correlationId) {
+        await this.publierReponseRevocation(replyTo, correlationId, {
+          demandeId: payload?.demandeId ?? correlationId,
+          numeroSerieCertificat: payload?.numeroSerieCertificat ?? '',
+          identifiantAc: this.acId,
+          statut: 'REJETEE',
+          erreur: {
+            httpStatus: 400,
+            code: 'COMMANDE_INVALIDE',
+            message: 'Commande DEMANDE_REVOCATION incomplète.'
+          }
+        });
+      }
       return;
     }
 
+    const resultat = await this.traiterInvalidation(
+      payload.numeroSerieCertificat,
+      payload.action,
+      payload.motif
+    );
+
+    if (!replyTo || !correlationId) {
+      return;
+    }
+
+    if (!resultat.succes) {
+      await this.publierReponseRevocation(replyTo, correlationId, {
+        demandeId: payload.demandeId,
+        numeroSerieCertificat: payload.numeroSerieCertificat,
+        identifiantAc: this.acId,
+        statut: 'REJETEE',
+        erreur: {
+          httpStatus: resultat.httpStatus,
+          code: resultat.code,
+          message: resultat.message
+        }
+      });
+      return;
+    }
+
+    await this.publierReponseRevocation(replyTo, correlationId, {
+      demandeId: payload.demandeId,
+      numeroSerieCertificat: resultat.numeroSerieCertificat,
+      identifiantAc: resultat.identifiantAc,
+      statut: 'APPLIQUEE',
+      actionAppliquee: resultat.actionAppliquee,
+      nouvelEtatCertificat: resultat.nouvelEtatCertificat,
+      horodatagePublicationLcr: resultat.horodatagePublicationLcr
+    });
+  }
+
+  private async traiterDemandeCertificationAmqp(message: AmqpMessage): Promise<void> {
     const payload = message.payload as Partial<CommandeDemandeCertificationPayload> | null;
     const correlationId = message.properties.correlation_id ?? payload?.demandeId;
     const replyTo = message.properties.reply_to;
@@ -336,7 +541,7 @@ export class AutoriteCertification {
       return;
     }
 
-    const debut = new Date();
+    const debut = this.horloge();
     const dureeJours = payload.dureeValiditeJours ?? 365;
     const fin = new Date(debut.getTime() + dureeJours * 24 * 60 * 60 * 1000);
 
@@ -402,12 +607,26 @@ export class AutoriteCertification {
     });
   }
 
+  private async publierReponseRevocation(
+    replyTo: string,
+    correlationId: string,
+    payload: ReponseDemandeRevocationPayload
+  ): Promise<void> {
+    await this.broker.publish(AMQP_EXCHANGES.COMMANDES, replyTo, payload, {
+      type: 'REPONSE_REVOCATION',
+      correlation_id: correlationId,
+      headers: {
+        acId: this.acId
+      }
+    });
+  }
+
   private signerCertificatAc(
     sujetAcId: string,
     clePubliqueBase64: string,
     options: OptionsValiditeAc
   ): Certificat {
-    const debut = options.dateDebut ?? new Date();
+    const debut = options.dateDebut ?? this.horloge();
     const dureeJours = options.dureeValiditeJours ?? 3650;
     const fin = new Date(debut.getTime() + dureeJours * 24 * 60 * 60 * 1000);
 
@@ -465,7 +684,8 @@ export async function amorcerHierarchieAc(
     niveau: 1,
     acParenteId: null,
     broker,
-    generateurNumeroSerie
+    generateurNumeroSerie,
+    ...(options.horloge ? { horloge: options.horloge } : {})
   });
 
   const dsi = new AutoriteCertification({
@@ -474,7 +694,8 @@ export async function amorcerHierarchieAc(
     niveau: 2,
     acParenteId: 'AC-N1-RACINE',
     broker,
-    generateurNumeroSerie
+    generateurNumeroSerie,
+    ...(options.horloge ? { horloge: options.horloge } : {})
   });
 
   const infra = new AutoriteCertification({
@@ -483,7 +704,8 @@ export async function amorcerHierarchieAc(
     niveau: 2,
     acParenteId: 'AC-N1-RACINE',
     broker,
-    generateurNumeroSerie
+    generateurNumeroSerie,
+    ...(options.horloge ? { horloge: options.horloge } : {})
   });
 
   const dsiMessagerie = new AutoriteCertification({
@@ -492,7 +714,8 @@ export async function amorcerHierarchieAc(
     niveau: 3,
     acParenteId: 'AC-N2-DSI',
     broker,
-    generateurNumeroSerie
+    generateurNumeroSerie,
+    ...(options.horloge ? { horloge: options.horloge } : {})
   });
 
   const infraReseau = new AutoriteCertification({
@@ -501,7 +724,8 @@ export async function amorcerHierarchieAc(
     niveau: 3,
     acParenteId: 'AC-N2-INFRA',
     broker,
-    generateurNumeroSerie
+    generateurNumeroSerie,
+    ...(options.horloge ? { horloge: options.horloge } : {})
   });
 
   await racine.autoSignerRacine(options);
