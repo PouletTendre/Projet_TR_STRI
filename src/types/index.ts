@@ -115,6 +115,42 @@ export interface RestResponse<TBody = unknown> {
   headers?: Record<string, string>;
 }
 
+export type RestTransport = (req: RestRequest) => Promise<RestResponse>;
+
+export interface StatutCertificatReponse {
+  numeroSerie: string;
+  statut: StatutCertificat;
+  identifiantAcEmettrice: string | null;
+  motifInvalidation: string | null;
+  dateInvalidation: string | null;
+  horodatageVerification: string;
+  identifiantAv: string;
+}
+
+export interface ValidationCertificatRequete {
+  numeroSerieCertificat: string;
+  natureRessource: NatureRessource;
+  usageAttendu: UsageCle;
+  sujetAttendu?: string;
+}
+
+export interface DetailsEtapesValidation {
+  etape1ValiditeTemporelle: boolean;
+  etape2ChaineEtSignatures: boolean;
+  etape3StatutAv: boolean;
+  etape4PolitiqueUsageEtSujet: boolean;
+  messageDiagnostic: string;
+}
+
+export interface ValidationCertificatReponse {
+  valide: boolean;
+  numeroSerieCertificat: string;
+  statutCourant: StatutCertificat;
+  detailsEtapes: DetailsEtapesValidation;
+  cheminCertification: Certificat[];
+  horodatageValidation: string;
+}
+
 export type AmqpExchangeType = 'direct' | 'topic';
 
 export interface AmqpProperties {
