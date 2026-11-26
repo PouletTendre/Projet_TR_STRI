@@ -4,3 +4,5 @@ export * from './amqp/index.js';
 export * from './ac/index.js';
 export * from './ae/index.js';
 export * from './annuaire/index.js';
+export * from './av/index.js';
+export * from './client/utilisateur-icp.js';
