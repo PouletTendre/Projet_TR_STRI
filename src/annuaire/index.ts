@@ -14,6 +14,10 @@ import type {
 
 export const QUEUE_PUBLICATION_FLUX = 'q.pki.publication.flux';
 
+export interface ServicePublicationOptions {
+  horloge?: () => Date;
+}
+
 function cloneCertificat(cert: Certificat): Certificat {
   return { ...cert };
 }
@@ -111,14 +115,16 @@ function parseBooleanQuery(
  */
 export class ServicePublication {
   private readonly broker: InMemoryAmqpBroker;
+  private readonly horloge: () => Date;
   private readonly certificats = new Map<string, Certificat>();
   private readonly autorites = new Map<string, AutoriteCertificationInfo>();
   private readonly lcrs = new Map<string, ListeCertificatsRevoques>();
   private readonly initPromise: Promise<void>;
   private consumerTag: string | null = null;
 
-  constructor(broker: InMemoryAmqpBroker) {
+  constructor(broker: InMemoryAmqpBroker, options: ServicePublicationOptions = {}) {
     this.broker = broker;
+    this.horloge = options.horloge ?? (() => new Date());
     this.broker.declareExchange(AMQP_EXCHANGES.PUBLICATIONS, 'topic', { durable: true });
     this.broker.declareQueue(QUEUE_PUBLICATION_FLUX, { durable: true });
     this.broker.bindQueue(QUEUE_PUBLICATION_FLUX, AMQP_EXCHANGES.PUBLICATIONS, '#');
@@ -220,7 +226,12 @@ export class ServicePublication {
 
     if (type === 'PUBLICATION_LCR' || payload.lcr) {
       const lcr = payload.lcr;
-      if (lcr) {
+      if (
+        lcr &&
+        typeof lcr.identifiantAc === 'string' &&
+        typeof lcr.numeroVersionLcr === 'number' &&
+        Array.isArray(lcr.entrees)
+      ) {
         const existing = this.lcrs.get(lcr.identifiantAc);
         if (!existing || lcr.numeroVersionLcr >= existing.numeroVersionLcr) {
           this.lcrs.set(lcr.identifiantAc, cloneLcr(lcr));
@@ -229,7 +240,7 @@ export class ServicePublication {
     }
   }
 
-  private estCertificatValide(cert: Certificat, horodatageMs = Date.now()): boolean {
+  private estCertificatValide(cert: Certificat, horodatageMs = this.horloge().getTime()): boolean {
     const debutMs = Date.parse(cert.dateDebutValidite);
     const finMs = Date.parse(cert.dateFinValidite);
     if (Number.isNaN(debutMs) || Number.isNaN(finMs)) {
@@ -260,7 +271,7 @@ export class ServicePublication {
       typeof query.acEmettriceId === 'string' ? query.acEmettriceId : undefined;
     const usage = typeof query.usage === 'string' ? query.usage : undefined;
     const uniquementValides = parseBooleanQuery(query.uniquementValides, true);
-    const nowMs = Date.now();
+    const nowMs = this.horloge().getTime();
 
     const resultats: Certificat[] = [];
     for (const cert of this.certificats.values()) {

@@ -210,3 +210,44 @@ export interface ReponseDemandeCertificationPayload {
     message: string;
   };
 }
+
+export interface DemandeRevocationRequete {
+  nomEntite: string;
+  motDePasse: string;
+  numeroSerieCertificat: string;
+  action: ActionRevocation;
+  motif?: MotifRevocation;
+}
+
+export interface DemandeRevocationReponse {
+  demandeId: string;
+  numeroSerieCertificat: string;
+  identifiantAc?: string;
+  actionAppliquee: ActionRevocation;
+  nouvelEtatCertificat: StatutCertificat;
+  horodatagePublicationLcr: string;
+}
+
+export interface CommandeDemandeRevocationPayload {
+  demandeId: string;
+  sujet: string;
+  numeroSerieCertificat: string;
+  acCibleId: string;
+  action: ActionRevocation;
+  motif?: MotifRevocation;
+}
+
+export interface ReponseDemandeRevocationPayload {
+  demandeId: string;
+  numeroSerieCertificat: string;
+  identifiantAc: string;
+  statut: 'APPLIQUEE' | 'REJETEE';
+  actionAppliquee?: ActionRevocation;
+  nouvelEtatCertificat?: StatutCertificat;
+  horodatagePublicationLcr?: string;
+  erreur?: {
+    httpStatus?: number;
+    code: string;
+    message: string;
+  };
+}

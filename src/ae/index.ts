@@ -1,18 +1,25 @@
 import { randomUUID } from 'node:crypto';
 import { AMQP_EXCHANGES, InMemoryAmqpBroker } from '../amqp/index.js';
+import type { ServicePublication } from '../annuaire/index.js';
 import { hashPassword, verifyPassword } from '../crypto/index.js';
 import type {
+  ActionRevocation,
   AmqpMessage,
   Certificat,
   CommandeDemandeCertificationPayload,
+  CommandeDemandeRevocationPayload,
   DemandeCertificationReponse,
   DemandeCertificationRequete,
+  DemandeRevocationReponse,
+  DemandeRevocationRequete,
   DroitsEntiteAE,
   EntiteAEInscription,
   EntiteAERegistre,
   ErreurApi,
+  MotifRevocation,
   NatureRessource,
   ReponseDemandeCertificationPayload,
+  ReponseDemandeRevocationPayload,
   RestRequest,
   RestResponse,
   StatutDemandeCertification,
@@ -32,9 +39,15 @@ interface AttenteReponseCertification {
   timer: ReturnType<typeof setTimeout>;
 }
 
+interface AttenteReponseRevocation {
+  resolve: (reponse: ReponseDemandeRevocationPayload) => void;
+  timer: ReturnType<typeof setTimeout>;
+}
+
 export interface AutoriteEnregistrementConfig {
   nature: NatureRessource;
   broker: InMemoryAmqpBroker;
+  servicePublication?: ServicePublication;
   entites?: EntiteAEInscription[];
   delaiReponseAcMs?: number;
   acsConnues?: string[];
@@ -124,6 +137,12 @@ const USAGES_PORTEUR_AUTORISES = new Set<UsageCle>([
   'SIGNATURE_ET_CHIFFREMENT'
 ]);
 
+const ACTIONS_REVOCATION_AUTORISEES = new Set<ActionRevocation>([
+  'REVOCATION',
+  'SUSPENSION',
+  'REACTIVATION'
+]);
+
 function aDroitPourUsage(entite: EntiteAERegistre, usage: UsageCle): boolean {
   if (usage === 'SIGNATURE') {
     return entite.droitSignature;
@@ -149,11 +168,13 @@ export class AutoriteEnregistrement {
   readonly routingKeyReponses: string;
 
   private readonly broker: InMemoryAmqpBroker;
+  private readonly servicePublication: ServicePublication | null;
   private readonly entites = new Map<string, EntiteAERegistre>();
   private readonly acsConnues: Set<string> | null;
   private readonly delaiReponseAcMs: number;
   private readonly demandes = new Map<string, DemandeCertificationSuivi>();
   private readonly attentes = new Map<string, AttenteReponseCertification>();
+  private readonly attentesRevocation = new Map<string, AttenteReponseRevocation>();
   private readonly clesPriveesEphemeres = new Map<string, string>();
   private readonly initPromise: Promise<void>;
   private consumerTag: string | null = null;
@@ -164,6 +185,7 @@ export class AutoriteEnregistrement {
     this.queueReponses = queueAeReponses(this.aeId);
     this.routingKeyReponses = routingKeyAe(this.aeId);
     this.broker = config.broker;
+    this.servicePublication = config.servicePublication ?? null;
     this.delaiReponseAcMs = config.delaiReponseAcMs ?? 2000;
     this.acsConnues = config.acsConnues ? new Set(config.acsConnues) : null;
 
@@ -197,6 +219,10 @@ export class AutoriteEnregistrement {
     for (const [demandeId, attente] of this.attentes.entries()) {
       clearTimeout(attente.timer);
       this.attentes.delete(demandeId);
+    }
+    for (const [demandeId, attente] of this.attentesRevocation.entries()) {
+      clearTimeout(attente.timer);
+      this.attentesRevocation.delete(demandeId);
     }
     this.clesPriveesEphemeres.clear();
     if (this.consumerTag) {
@@ -282,6 +308,20 @@ export class AutoriteEnregistrement {
         decodeURIComponent(demandeDetailMatch[2]),
         req.path
       );
+    }
+
+    const revocationsMatch = /^\/ae\/([^/]+)\/demandes-revocation$/.exec(normalizedPath);
+    if (revocationsMatch && revocationsMatch[1]) {
+      const erreurRoute = this.verifierRouteNatureEtMethode(
+        revocationsMatch[1],
+        'POST',
+        method,
+        req.path
+      );
+      if (erreurRoute) {
+        return erreurRoute;
+      }
+      return this.soumettreDemandeRevocation(req);
     }
 
     return buildError(
@@ -571,7 +611,241 @@ export class AutoriteEnregistrement {
     };
   }
 
+  private async soumettreDemandeRevocation(
+    req: RestRequest
+  ): Promise<RestResponse<DemandeRevocationReponse | ErreurApi>> {
+    const body = req.body as Partial<DemandeRevocationRequete> | null | undefined;
+    if (!body || typeof body !== 'object') {
+      return buildError(
+        400,
+        'REQUETE_INVALIDE',
+        'Le corps de la demande de révocation est requis.',
+        req.path
+      );
+    }
+
+    if (typeof body.nomEntite !== 'string' || body.nomEntite.trim() === '') {
+      return buildError(
+        400,
+        'REQUETE_INVALIDE',
+        'Le champ "nomEntite" doit être une chaîne non vide.',
+        req.path
+      );
+    }
+
+    if (typeof body.motDePasse !== 'string' || body.motDePasse === '') {
+      return buildError(
+        400,
+        'REQUETE_INVALIDE',
+        'Le champ "motDePasse" est requis.',
+        req.path
+      );
+    }
+
+    if (
+      typeof body.numeroSerieCertificat !== 'string' ||
+      body.numeroSerieCertificat.trim() === ''
+    ) {
+      return buildError(
+        400,
+        'REQUETE_INVALIDE',
+        'Le champ "numeroSerieCertificat" doit être une chaîne non vide.',
+        req.path
+      );
+    }
+
+    if (
+      typeof body.action !== 'string' ||
+      !ACTIONS_REVOCATION_AUTORISEES.has(body.action as ActionRevocation)
+    ) {
+      return buildError(
+        400,
+        'REQUETE_INVALIDE',
+        'Le champ "action" doit être REVOCATION, SUSPENSION ou REACTIVATION.',
+        req.path
+      );
+    }
+
+    if (
+      body.motif !== undefined &&
+      (typeof body.motif !== 'string' || body.motif.trim() === '')
+    ) {
+      return buildError(
+        400,
+        'REQUETE_INVALIDE',
+        'Le champ "motif" doit être une chaîne non vide lorsqu’il est fourni.',
+        req.path
+      );
+    }
+
+    const entite = this.entites.get(body.nomEntite);
+    if (!entite || !verifyPassword(body.motDePasse, entite.motDePasseHash)) {
+      return buildError(
+        401,
+        'NON_AUTHENTIFIE',
+        `Échec d'authentification pour l'entité "${body.nomEntite}".`,
+        req.path
+      );
+    }
+
+    if (!entite.droitDemandeRevocation) {
+      return buildError(
+        403,
+        'DROITS_INSUFFISANTS',
+        `L'entité "${entite.nomEntite}" ne dispose pas du droit de demande de révocation.`,
+        req.path
+      );
+    }
+
+    const numeroSerie = body.numeroSerieCertificat.trim();
+    if (!this.servicePublication) {
+      return buildError(
+        404,
+        'CERTIFICAT_INTROUVABLE',
+        `Certificat "${numeroSerie}" introuvable : aucun Service de Publication configuré.`,
+        req.path
+      );
+    }
+
+    const repCert = this.servicePublication.handleRestRequest({
+      method: 'GET',
+      path: `/annuaire/certificats/${encodeURIComponent(numeroSerie)}`
+    });
+    if (repCert.status !== 200) {
+      return buildError(
+        404,
+        'CERTIFICAT_INTROUVABLE',
+        `Aucun certificat trouvé pour le numéro de série "${numeroSerie}".`,
+        req.path
+      );
+    }
+
+    const cert = repCert.body as Certificat;
+    if (cert.sujet !== entite.nomEntite) {
+      return buildError(
+        403,
+        'DROITS_INSUFFISANTS',
+        `Le certificat "${numeroSerie}" n'appartient pas au sujet "${entite.nomEntite}".`,
+        req.path
+      );
+    }
+
+    const acCibleId = cert.identifiantAcEmettrice;
+    if (!this.estAcCibleValide(acCibleId)) {
+      return buildError(
+        404,
+        'AUTORITE_INTROUVABLE',
+        `AC émettrice introuvable : "${acCibleId}".`,
+        req.path
+      );
+    }
+
+    const demandeId = randomUUID();
+    await this.ready();
+
+    const reponsePromise = new Promise<ReponseDemandeRevocationPayload | null>((resolve) => {
+      const timer = setTimeout(() => {
+        this.attentesRevocation.delete(demandeId);
+        resolve(null);
+      }, this.delaiReponseAcMs);
+      this.attentesRevocation.set(demandeId, {
+        resolve: (payload) => resolve(payload),
+        timer
+      });
+    });
+
+    const commandePayload: CommandeDemandeRevocationPayload = {
+      demandeId,
+      sujet: entite.nomEntite,
+      numeroSerieCertificat: numeroSerie,
+      acCibleId,
+      action: body.action as ActionRevocation,
+      ...(typeof body.motif === 'string' && body.motif.trim() !== ''
+        ? { motif: body.motif.trim() as MotifRevocation }
+        : {})
+    };
+
+    await this.broker.publish(
+      AMQP_EXCHANGES.COMMANDES,
+      `ac.${acCibleId}`,
+      commandePayload,
+      {
+        type: 'DEMANDE_REVOCATION',
+        correlation_id: demandeId,
+        reply_to: this.routingKeyReponses,
+        headers: {
+          aeId: this.aeId,
+          natureRessource: this.nature
+        }
+      }
+    );
+
+    const reponseAc = await reponsePromise;
+    if (!reponseAc) {
+      return buildError(
+        504,
+        'DELAI_AC_DEPASSE',
+        `L'AC "${acCibleId}" n'a pas répondu dans le délai imparti.`,
+        req.path
+      );
+    }
+
+    if (
+      reponseAc.statut === 'REJETEE' ||
+      !reponseAc.actionAppliquee ||
+      !reponseAc.nouvelEtatCertificat ||
+      !reponseAc.horodatagePublicationLcr
+    ) {
+      return buildError(
+        reponseAc.erreur?.httpStatus ?? 409,
+        reponseAc.erreur?.code ?? 'TRANSITION_INVALIDE',
+        reponseAc.erreur?.message ?? 'La demande de révocation a été rejetée par l’AC.',
+        req.path
+      );
+    }
+
+    return {
+      status: 200,
+      body: {
+        demandeId,
+        numeroSerieCertificat: reponseAc.numeroSerieCertificat,
+        identifiantAc: reponseAc.identifiantAc,
+        actionAppliquee: reponseAc.actionAppliquee,
+        nouvelEtatCertificat: reponseAc.nouvelEtatCertificat,
+        horodatagePublicationLcr: reponseAc.horodatagePublicationLcr
+      }
+    };
+  }
+
   private traiterReponseAmqp(message: AmqpMessage): void {
+    if (message.properties.type === 'REPONSE_REVOCATION') {
+      const payload = message.payload as Partial<ReponseDemandeRevocationPayload> | null;
+      const demandeId = message.properties.correlation_id ?? payload?.demandeId;
+      if (!demandeId || !payload) {
+        return;
+      }
+      const attenteRev = this.attentesRevocation.get(demandeId);
+      if (attenteRev) {
+        clearTimeout(attenteRev.timer);
+        this.attentesRevocation.delete(demandeId);
+        attenteRev.resolve({
+          demandeId,
+          numeroSerieCertificat: payload.numeroSerieCertificat ?? '',
+          identifiantAc: payload.identifiantAc ?? '',
+          statut: payload.statut === 'APPLIQUEE' ? 'APPLIQUEE' : 'REJETEE',
+          ...(payload.actionAppliquee ? { actionAppliquee: payload.actionAppliquee } : {}),
+          ...(payload.nouvelEtatCertificat
+            ? { nouvelEtatCertificat: payload.nouvelEtatCertificat }
+            : {}),
+          ...(payload.horodatagePublicationLcr
+            ? { horodatagePublicationLcr: payload.horodatagePublicationLcr }
+            : {}),
+          ...(payload.erreur ? { erreur: payload.erreur } : {})
+        });
+      }
+      return;
+    }
+
     if (message.properties.type !== 'REPONSE_CERTIFICATION') {
       return;
     }
