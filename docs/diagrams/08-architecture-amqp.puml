@@ -1,0 +1,49 @@
+@startuml
+left to right direction
+skinparam shadowing false
+
+package "Producteurs AMQP 0-9-1" {
+  rectangle "AE (par nature)" as Prod_AE
+  rectangle "AC (N1, N2, N3)" as Prod_AC
+  rectangle "Correspondant émetteur" as Prod_Chat
+}
+
+package "Échangeurs durables (Broker AMQP 0-9-1)" {
+  rectangle "ex.pki.commandes\n(type: direct, durable)" as Ex_Cmd
+  rectangle "ex.pki.publications\n(type: topic, durable)" as Ex_Pub
+  rectangle "ex.chat.messages\n(type: direct, durable)" as Ex_Chat
+}
+
+package "Files durables" {
+  queue "q.pki.ac.<id_ac>.demandes" as Q_Ac
+  queue "q.pki.ae.<id_ae>.reponses" as Q_Ae
+  queue "q.pki.publication.flux" as Q_Pub
+  queue "q.pki.av.<nature>.flux" as Q_Av
+  queue "q.chat.inbox.<id_correspondant>" as Q_Chat
+}
+
+package "Consommateurs AMQP 0-9-1" {
+  rectangle "AC de niveau 3" as Cons_AC
+  rectangle "AE (réception réponses)" as Cons_AE
+  rectangle "Service de Publication" as Cons_Pub
+  rectangle "AV (par nature)" as Cons_AV
+  rectangle "Correspondant destinataire" as Cons_Chat
+}
+
+Prod_AE --> Ex_Cmd : clé: ac.<id_ac>\n(reply_to: ae.<id_ae>, correlation_id)
+Prod_AC --> Ex_Cmd : clé: ae.<id_ae>\n(via reply_to, correlation_id)
+Prod_AC --> Ex_Pub : clés: certificat.<niveau>.<nature>,\ncertificat.<niveau>.ac, lcr.<id_ac>
+Prod_Chat --> Ex_Chat : clé: inbox.<id_correspondant>
+
+Ex_Cmd --> Q_Ac : binding: ac.<id_ac>
+Ex_Cmd --> Q_Ae : binding: ae.<id_ae>
+Ex_Pub --> Q_Pub : binding: #
+Ex_Pub --> Q_Av : bindings: certificat.*.<nature>,\ncertificat.*.ac, lcr.#
+Ex_Chat --> Q_Chat : binding: inbox.<id_correspondant>
+
+Q_Ac --> Cons_AC : consommation commandes
+Q_Ae --> Cons_AE : corrélation réponse
+Q_Pub --> Cons_Pub : indexation annuaire & LCR
+Q_Av --> Cons_AV : mise à jour statut courant
+Q_Chat --> Cons_Chat : remise du Message
+@enduml

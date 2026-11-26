@@ -1,0 +1,27 @@
+@startuml
+left to right direction
+skinparam shadowing false
+
+rectangle "Ressources\n(Porteurs, Utilisateurs ICP,\nCorrespondants)" as Ressources
+
+package "Couche Edge" {
+  rectangle "API Gateway" as APIGW
+  rectangle "Passerelle Edge Messagerie" as MsgGW
+  rectangle "Service Discovery" as Discovery
+  rectangle "Configuration Server" as ConfigServer
+}
+
+rectangle "Services ICP\n(AE, AV, Service de Publication,\nHiérarchie d'AC)" as ServicesICP
+rectangle "Messagerie\n(Broker AMQP 0-9-1)" as Messagerie
+
+Ressources --> APIGW : Demandes d'enrôlement,\nstatuts et annuaire
+Ressources <--> MsgGW : Échanges de Messages sécurisés
+
+APIGW --> ServicesICP : Routage par nature,\nTLS et limitation de débit
+APIGW ..> Discovery : Résolution des instances
+ServicesICP ..> Discovery : Enregistrement dynamique
+ServicesICP ..> ConfigServer : Topologie AC & ancre racine
+
+MsgGW <--> Messagerie : Cloisonnement ACL strict\n(ex.chat.messages & q.chat.inbox)
+ServicesICP <--> Messagerie : Commandes & publications internes
+@enduml

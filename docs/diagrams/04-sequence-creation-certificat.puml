@@ -1,0 +1,24 @@
+@startuml
+skinparam shadowing false
+
+actor "Porteur" as Porteur
+participant "AE" as AE
+participant "AC" as AC
+participant "Service de Publication" as Pub
+participant "AV" as AV
+
+Porteur -> Porteur : Générer la Biclé localement\n(clé publique et clé privée)
+Porteur -> AE : Demander un Certificat\n(identité, secret, usage, clé publique)
+AE -> AE : Authentifier le Porteur\net vérifier ses droits d'usage
+
+alt Authentification invalide ou droits insuffisants
+  AE --> Porteur : Refus de la demande
+else Demande autorisée
+  AE -> AC : Transmettre la demande\nvers l'AC de service compétente
+  AC -> AC : Attribuer un numéro de série unique,\nfixer la validité et signer le Certificat
+  AC -> Pub : Publier le Certificat signé
+  AC -> AV : Notifier le nouveau Certificat
+  AC --> AE : Retourner le Certificat signé
+  AE --> Porteur : Délivrer le Certificat
+end
+@enduml

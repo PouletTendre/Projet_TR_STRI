@@ -1,0 +1,19 @@
+@startuml
+skinparam shadowing false
+
+actor "Utilisateur ICP" as User
+participant "Service de Publication" as Pub
+participant "AV" as AV
+
+User -> Pub : Récupérer le Certificat cible\net son Chemin de certification (N3 -> N2 -> AC Racine)
+Pub --> User : Certificat cible et chaîne complète d'AC
+
+User -> User : Étape 1 — Contrôler la période de validité\nde chaque Certificat du Chemin de certification
+
+User -> User : Étape 2 — Vérifier les signatures\ndu Certificat jusqu'à l'AC Racine\net l'usage CERTIFICATION_AC des AC Filles
+
+User -> AV : Étape 3 — Consulter le statut courant\n(Certificat cible et AC Filles)
+AV --> User : Statut (VALIDE, SUSPENDU, REVOQUE ou INCONNU)
+
+User -> User : Étape 4 — Contrôler la politique d'usage\n(SIGNATURE, CHIFFREMENT, SIGNATURE_ET_CHIFFREMENT)
+@enduml
