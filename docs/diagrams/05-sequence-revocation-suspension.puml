@@ -1,0 +1,24 @@
+@startuml
+skinparam shadowing false
+
+actor "Porteur" as Porteur
+participant "AE" as AE
+participant "AC" as AC
+participant "Service de Publication" as Pub
+participant "AV" as AV
+
+Porteur -> AE : Demander Révocation, Suspension\nou Réactivation d'un Certificat
+AE -> AE : Authentifier le Porteur,\nvérifier droit_de_demande_de_revocation\net l'appartenance du Certificat
+
+alt Demande non autorisée
+  AE --> Porteur : Refus de la demande
+else Demande autorisée
+  AE -> AC : Relayer la demande d'invalidation\nou de réactivation
+  AC -> AC : Contrôler le cycle de vie\n(non expiré, non révoqué définitivement)
+  AC -> AC : Mettre à jour et signer la LCR\n(statut REVOQUE, SUSPENDU ou VALIDE)
+  AC -> Pub : Diffuser la LCR mise à jour
+  AC -> AV : Diffuser la LCR mise à jour
+  AC --> AE : Confirmer la mise à jour
+  AE --> Porteur : Confirmer le nouvel état du Certificat
+end
+@enduml

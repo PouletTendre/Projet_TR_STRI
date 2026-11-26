@@ -1,0 +1,19 @@
+@startuml
+top to bottom direction
+skinparam shadowing false
+
+rectangle "Ressources & Clients" as Ressources
+rectangle "Autorités d'Enregistrement (par nature)" as AE
+rectangle "Autorités de Validation (par nature)" as AV
+rectangle "Service de Publication" as Publication
+rectangle "Hiérarchie d'AC (3 niveaux)" as AC
+rectangle "Messagerie Sécurisée" as Messagerie
+
+Ressources --> AE : Demandes d'enrôlement,\nde révocation et droits
+AE --> AC : Demandes validées\net rattachées
+AC --> Publication : Diffusion des Certificats\net des LCR
+AC --> AV : Mises à jour de statut\n(Certificats et LCR)
+Ressources --> AV : Vérification du statut courant
+Ressources --> Publication : Consultation des Certificats,\nChemins de certification et LCR
+Ressources <--> Messagerie : Échanges de Messages sécurisés\net clôture FIN_MSG
+@enduml

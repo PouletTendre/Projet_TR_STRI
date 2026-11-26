@@ -1,0 +1,31 @@
+@startuml
+left to right direction
+skinparam shadowing false
+
+actor "Administrateur PKI" as Admin
+actor "Porteur" as Porteur
+actor "Utilisateur ICP" as Utilisateur
+actor "Correspondant" as Correspondant
+
+rectangle "Domaine de confiance — ICP & Messagerie Sécurisée" {
+  usecase "Administrer la hiérarchie d'AC\n(Niveaux 1, 2 et 3)" as UC_Hierarchie
+  usecase "Enregistrer les Ressources\net leurs droits auprès des AE" as UC_Enregistrement
+  usecase "Demander la création\nd'un Certificat" as UC_Creation
+  usecase "Demander la révocation, suspension\nou réactivation d'un Certificat" as UC_Revocation
+  usecase "Consulter les Certificats,\nChemins de certification et LCR" as UC_Consultation
+  usecase "Valider un Certificat\n(processus en 4 étapes)" as UC_Validation
+  usecase "Conduire un Échange\nde Messages sécurisés" as UC_Messagerie
+}
+
+Admin --> UC_Hierarchie
+Admin --> UC_Enregistrement
+
+Porteur --> UC_Creation
+Porteur --> UC_Revocation
+
+Utilisateur --> UC_Consultation
+Utilisateur --> UC_Validation
+
+Correspondant --> UC_Messagerie
+UC_Messagerie ..> UC_Validation : <<include>>
+@enduml

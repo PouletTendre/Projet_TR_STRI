@@ -1,0 +1,36 @@
+@startuml
+skinparam shadowing false
+
+actor "Correspondant A" as A
+participant "Service de Publication" as Pub
+participant "AV" as AV
+actor "Correspondant B" as B
+
+A -> A : Choisir le Niveau de sécurité du premier Message\n(NON_SECURISE, SIGNE, CHIFFRE ou SIGNE_ET_CHIFFRE)
+
+alt Niveau de sécurité protégé (SIGNE / CHIFFRE / SIGNE_ET_CHIFFRE)
+  A -> Pub : Récupérer le Certificat et le Chemin de certification de B
+  Pub --> A : Certificat et chaîne de B
+  A -> AV : Valider en 4 étapes le Certificat de B\n(et contrôler son propre Certificat)
+  AV --> A : Statut VALIDE
+end
+
+A -> B : Premier Message (initialisation de l'Échange\navec Niveau de sécurité choisi)
+
+B -> Pub : Récupérer le Certificat de A
+Pub --> B : Certificat et chaîne de A
+B -> AV : Valider en 4 étapes le Certificat de A
+AV --> B : Statut VALIDE
+B -> B : Verrouiller de manière immuable\nle Niveau de sécurité de l'Échange
+
+loop Messages suivants dans le mode verrouillé
+  A -> B : Message protégé selon le Niveau de sécurité
+  B -> AV : Vérifier que le statut courant demeure VALIDE
+  AV --> B : Statut VALIDE
+  B -> A : Message en retour selon le même mode
+end
+
+A -> B : Message contenant uniquement FIN_MSG\n(protégé selon le Niveau de sécurité)
+A -> A : Clore l'Échange
+B -> B : Clore l'Échange et rejeter tout Message ultérieur
+@enduml

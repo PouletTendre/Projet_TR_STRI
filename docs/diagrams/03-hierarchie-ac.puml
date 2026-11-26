@@ -1,0 +1,28 @@
+@startuml
+top to bottom direction
+skinparam shadowing false
+
+rectangle "AC Racine (Niveau 1)\nCertificat auto-signé\nAncre du Domaine de confiance" as AC_N1
+
+rectangle "AC Fille Direction DSI (Niveau 2)\nCertifiée par AC Racine" as AC_N2_DSI
+rectangle "AC Fille Direction Métiers (Niveau 2)\nCertifiée par AC Racine" as AC_N2_MET
+
+rectangle "AC Fille Service Messagerie (Niveau 3)\nCertifiée par AC Direction DSI" as AC_N3_MSG
+rectangle "AC Fille Service Infrastructure (Niveau 3)\nCertifiée par AC Direction DSI" as AC_N3_INFRA
+rectangle "AC Fille Service Utilisateurs (Niveau 3)\nCertifiée par AC Direction Métiers" as AC_N3_USR
+
+rectangle "Porteurs\n(Correspondants messagerie)" as P_MSG
+rectangle "Porteurs\n(Routeurs & équipements)" as P_INFRA
+rectangle "Porteurs\n(Agents & utilisateurs)" as P_USR
+
+AC_N1 --> AC_N2_DSI : Certification directe N1 -> N2
+AC_N1 --> AC_N2_MET : Certification directe N1 -> N2
+
+AC_N2_DSI --> AC_N3_MSG : Certification directe N2 -> N3
+AC_N2_DSI --> AC_N3_INFRA : Certification directe N2 -> N3
+AC_N2_MET --> AC_N3_USR : Certification directe N2 -> N3
+
+AC_N3_MSG --> P_MSG : Émission de Certificats\n(via AE messagerie)
+AC_N3_INFRA --> P_INFRA : Émission de Certificats\n(via AE routeurs)
+AC_N3_USR --> P_USR : Émission de Certificats\n(via AE utilisateurs)
+@enduml
